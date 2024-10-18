@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use bytes::{BufMut, Bytes};
 use chrono::Utc;
-use fail_parallel::{fail_point, FailPointRegistry};
+use fail_parallel::{fail_point, fail_point_async, FailPointRegistry};
 use futures::{future::join_all, StreamExt};
 use log::warn;
 use object_store::buffered::BufWriter;
@@ -161,7 +161,7 @@ impl TableStore {
         id: &SsTableId,
         encoded_sst: EncodedSsTable,
     ) -> Result<SsTableHandle, SlateDBError> {
-        fail_point!(
+        fail_point_async!(
             self.fp_registry.clone(),
             "write-wal-sst-io-error",
             matches!(id, SsTableId::Wal(_)),

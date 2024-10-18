@@ -642,10 +642,10 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
-
     use futures::StreamExt;
     use object_store::memory::InMemory;
     use object_store::ObjectStore;
+    use tokio::task::JoinHandle;
     use tracing::info;
 
     use super::*;
@@ -902,6 +902,42 @@ mod tests {
             ],
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_flush() {
+        let fp_registry = Arc::new(FailPointRegistry::new());
+        let object_store = Arc::new(InMemory::new());
+        let options = test_db_options(0, 1024, None);
+        let db = Arc::new(Db::open_with_fp_registry(
+            Path::from("/tmp/test_kv_store"),
+            options,
+            object_store.clone(),
+            fp_registry.clone()
+        ).await.unwrap());
+
+        let key = [b'a'; 2];
+        let value = [b'b'; 5];
+        let non_durable_options = WriteOptions {
+            await_durable: false
+        };
+        db.put_with_options(&key, &value, &non_durable_options).await;
+        fail_parallel::cfg(fp_registry.clone(), "write-wal-sst-io-error", "2*pause").unwrap();
+
+        fn spawn_flush(db: Arc<Db>) -> JoinHandle<Result<(), SlateDBError>> {
+            tokio::spawn(async move {
+                db.flush().await
+            })
+        }
+
+        let f1 = spawn_flush(db.clone());
+        let f2 = spawn_flush(db.clone());
+
+        tokio::task::yield_now().await;
+        fail_parallel::cfg(fp_registry.clone(), "write-wal-sst-io-error", "off").unwrap();
+        let (r1, r2) = futures::join!(f1, f2);
+        assert!(r1.unwrap().is_ok(), "Failed to flush");
+        assert!(r2.unwrap().is_ok(), "Failed to flush");
     }
 
     #[tokio::test]
