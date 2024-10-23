@@ -30,7 +30,7 @@ use crate::sorted_run_iterator::SortedRunIterator;
 use crate::sst::SsTableFormat;
 use crate::sst_iter::SstIterator;
 use crate::tablestore::TableStore;
-use crate::types::ValueDeletable;
+use crate::types::{RowAttributes, ValueDeletable};
 use std::rc::Rc;
 
 pub(crate) struct DbInner {
@@ -75,19 +75,19 @@ impl DbInner {
         let snapshot = self.state.read().snapshot();
 
         if matches!(options.read_level, Uncommitted) {
-            let maybe_bytes = std::iter::once(snapshot.wal)
+            let maybe_val = std::iter::once(snapshot.wal)
                 .chain(snapshot.state.imm_wal.iter().map(|imm| imm.table()))
                 .find_map(|memtable| memtable.get(key));
-            if let Some(val) = maybe_bytes {
-                return Ok(val.into_option());
+            if let Some(val) = maybe_val {
+                return Ok(val.value.into_option());
             }
         }
 
-        let maybe_bytes = std::iter::once(snapshot.memtable)
+        let maybe_val = std::iter::once(snapshot.memtable)
             .chain(snapshot.state.imm_memtable.iter().map(|imm| imm.table()))
             .find_map(|memtable| memtable.get(key));
-        if let Some(val) = maybe_bytes {
-            return Ok(val.into_option());
+        if let Some(val) = maybe_val {
+            return Ok(val.value.into_option());
         }
 
         // Since the key remains unchanged during the point query, we only need to compute
@@ -121,17 +121,12 @@ impl DbInner {
         Ok(None)
     }
 
-    async fn fence_writers(&self, manifest: &mut FenceableManifest) -> Result<(), SlateDBError> {
-        let wal_id_last_compacted = self.state.read().state().core.last_compacted_wal_sst_id;
-        let max_wal_id = self
-            .table_store
-            .list_wal_ssts((wal_id_last_compacted + 1)..)
-            .await?
-            .into_iter()
-            .map(|wal_sst| wal_sst.id.unwrap_wal_id())
-            .max()
-            .unwrap_or(0);
-        let mut empty_wal_id = max_wal_id + 1;
+    async fn fence_writers(
+        &self,
+        manifest: &mut FenceableManifest,
+        next_wal_id: u64,
+    ) -> Result<(), SlateDBError> {
+        let mut empty_wal_id = next_wal_id;
 
         loop {
             let empty_wal = WritableKVTable::new();
@@ -221,7 +216,13 @@ impl DbInner {
         let current_table = if self.wal_enabled() {
             let mut guard = self.state.write();
             let current_wal = guard.wal();
-            current_wal.put(key, value);
+            current_wal.put(
+                key,
+                value,
+                RowAttributes {
+                    ts: Some(self.options.clock.now()),
+                },
+            );
             current_wal.table().clone()
         } else {
             if cfg!(not(feature = "wal_disable")) {
@@ -229,7 +230,13 @@ impl DbInner {
             }
             let mut guard = self.state.write();
             let current_memtable = guard.memtable();
-            current_memtable.put(key, value);
+            current_memtable.put(
+                key,
+                value,
+                RowAttributes {
+                    ts: Some(self.options.clock.now()),
+                },
+            );
             let table = current_memtable.table().clone();
             let last_wal_id = guard.last_written_wal_id();
             self.maybe_freeze_memtable(&mut guard, last_wal_id);
@@ -254,7 +261,12 @@ impl DbInner {
         let current_table = if self.wal_enabled() {
             let mut guard = self.state.write();
             let current_wal = guard.wal();
-            current_wal.delete(key);
+            current_wal.delete(
+                key,
+                RowAttributes {
+                    ts: Some(self.options.clock.now()),
+                },
+            );
             current_wal.table().clone()
         } else {
             if cfg!(not(feature = "wal_disable")) {
@@ -262,7 +274,12 @@ impl DbInner {
             }
             let mut guard = self.state.write();
             let current_memtable = guard.memtable();
-            current_memtable.delete(key);
+            current_memtable.delete(
+                key,
+                RowAttributes {
+                    ts: Some(self.options.clock.now()),
+                },
+            );
             let table = current_memtable.table().clone();
             let last_wal_id = guard.last_written_wal_id();
             self.maybe_freeze_memtable(&mut guard, last_wal_id);
@@ -372,9 +389,15 @@ impl DbInner {
                 for kv in wal_replay_buf.iter() {
                     match &kv.value {
                         ValueDeletable::Value(value) => {
-                            guard.memtable().put(kv.key.clone(), value.clone());
+                            guard.memtable().put(
+                                kv.key.clone(),
+                                value.clone(),
+                                kv.attributes.clone(),
+                            );
                         }
-                        ValueDeletable::Tombstone => guard.memtable().delete(kv.key.clone()),
+                        ValueDeletable::Tombstone => guard
+                            .memtable()
+                            .delete(kv.key.clone(), kv.attributes.clone()),
                     }
                 }
                 self.maybe_freeze_memtable(&mut guard, sst_id);
@@ -470,7 +493,18 @@ impl Db {
         ));
 
         let manifest_store = Arc::new(ManifestStore::new(&path, maybe_cached_object_store.clone()));
-        let mut manifest = Self::init_db(&manifest_store).await?;
+        let latest_manifest = StoredManifest::load(manifest_store.clone()).await?;
+
+        // get the next wal id before writing manifest.
+        let wal_id_last_compacted = match &latest_manifest {
+            Some(latest_stored_manifest) => {
+                latest_stored_manifest.db_state().last_compacted_wal_sst_id
+            }
+            None => 0,
+        };
+        let next_wal_id = table_store.next_wal_sst_id(wal_id_last_compacted).await?;
+
+        let mut manifest = Self::init_db(&manifest_store, latest_manifest).await?;
         let (memtable_flush_tx, memtable_flush_rx) = tokio::sync::mpsc::unbounded_channel();
         let (wal_flush_tx, wal_flush_rx) = tokio::sync::mpsc::unbounded_channel();
         let (write_tx, write_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -487,7 +521,7 @@ impl Db {
             .await?,
         );
         if inner.wal_enabled() {
-            inner.fence_writers(&mut manifest).await?;
+            inner.fence_writers(&mut manifest, next_wal_id).await?;
         }
         inner.replay_wal().await?;
         let tokio_handle = Handle::current();
@@ -545,18 +579,13 @@ impl Db {
 
     async fn init_db(
         manifest_store: &Arc<ManifestStore>,
+        latest_stored_manifest: Option<StoredManifest>,
     ) -> Result<FenceableManifest, SlateDBError> {
-        let stored_manifest = Self::init_stored_manifest(manifest_store).await?;
+        let stored_manifest = match latest_stored_manifest {
+            Some(manifest) => manifest,
+            None => StoredManifest::init_new_db(manifest_store.clone(), CoreDbState::new()).await?,
+        };
         FenceableManifest::init_writer(stored_manifest).await
-    }
-
-    async fn init_stored_manifest(
-        manifest_store: &Arc<ManifestStore>,
-    ) -> Result<StoredManifest, SlateDBError> {
-        if let Some(stored_manifest) = StoredManifest::load(manifest_store.clone()).await? {
-            return Ok(stored_manifest);
-        }
-        StoredManifest::init_new_db(manifest_store.clone(), CoreDbState::new()).await
     }
 
     pub async fn close(&self) -> Result<(), SlateDBError> {
@@ -698,6 +727,7 @@ mod tests {
     use crate::sst_iter::SstIterator;
     #[cfg(feature = "wal_disable")]
     use crate::test_utils::assert_iterator;
+    use crate::test_utils::{gen_attrs, TestClock};
 
     #[tokio::test]
     async fn test_put_get_delete() {
@@ -1118,11 +1148,13 @@ mod tests {
                 (
                     vec![b'a'; 32],
                     ValueDeletable::Value(Bytes::copy_from_slice(&[b'j'; 32])),
+                    gen_attrs(0),
                 ),
-                (vec![b'b'; 32], ValueDeletable::Tombstone),
+                (vec![b'b'; 32], ValueDeletable::Tombstone, gen_attrs(1)),
                 (
                     vec![b'c'; 32],
                     ValueDeletable::Value(Bytes::copy_from_slice(&[b'l'; 32])),
+                    gen_attrs(2),
                 ),
             ],
         )
@@ -1255,14 +1287,17 @@ mod tests {
             lock.wal().put(
                 Bytes::copy_from_slice(b"abc1111"),
                 Bytes::copy_from_slice(b"value1111"),
+                gen_attrs(1),
             );
             lock.wal().put(
                 Bytes::copy_from_slice(b"abc2222"),
                 Bytes::copy_from_slice(b"value2222"),
+                gen_attrs(2),
             );
             lock.wal().put(
                 Bytes::copy_from_slice(b"abc3333"),
                 Bytes::copy_from_slice(b"value3333"),
+                gen_attrs(3),
             );
             lock.wal().table().clone()
         };
@@ -1756,6 +1791,7 @@ mod tests {
             object_store_cache_options: ObjectStoreCacheOptions::default(),
             block_cache: None,
             garbage_collector_options: None,
+            clock: Arc::new(TestClock::new()),
         }
     }
 }
