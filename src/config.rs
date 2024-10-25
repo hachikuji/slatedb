@@ -160,6 +160,7 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{str::FromStr, time::Duration};
+use bytes::Bytes;
 use tokio::runtime::Handle;
 
 use crate::compactor::CompactionScheduler;
@@ -169,6 +170,7 @@ use crate::db_cache::DbCache;
 use crate::size_tiered_compaction::SizeTieredCompactionSchedulerSupplier;
 
 pub const DEFAULT_READ_OPTIONS: &ReadOptions = &ReadOptions::default();
+pub const DEFAULT_SCAN_OPTIONS: &ScanOptions = &ScanOptions::default();
 pub const DEFAULT_WRITE_OPTIONS: &WriteOptions = &WriteOptions::default();
 
 /// Whether reads see only writes that have been committed durably to the DB.  A
@@ -196,6 +198,41 @@ impl ReadOptions {
     const fn default() -> Self {
         Self {
             read_level: ReadLevel::Commited,
+        }
+    }
+}
+
+pub struct ScanOptions {
+    /// The read commit level for read operations
+    pub read_level: ReadLevel,
+    /// The number of bytes to read ahead
+    pub read_ahead_size: usize,
+    /// Whether or not fetched blocks should be cached
+    pub cache_blocks: bool,
+}
+
+impl ScanOptions {
+    /// Create a new ScanOptions with `read_level` set to `Commited`.
+    const fn default() -> Self {
+        Self {
+            read_level: ReadLevel::Commited,
+            read_ahead_size: 0, // FIXME
+            cache_blocks: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Hash)]
+pub struct DbRecord {
+    pub key: Bytes,
+    pub value: Bytes,
+}
+
+impl DbRecord {
+    pub fn new(key: &[u8], value: &[u8]) -> Self {
+        Self {
+            key: Bytes::copy_from_slice(key),
+            value: Bytes::copy_from_slice(value),
         }
     }
 }

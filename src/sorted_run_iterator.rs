@@ -1,23 +1,65 @@
-use std::slice::Iter;
+use std::collections::VecDeque;
+use std::marker::PhantomData;
 use std::sync::Arc;
-
 use crate::db_state::{SortedRun, SsTableHandle};
 use crate::error::SlateDBError;
 use crate::iter::KeyValueIterator;
+use crate::range_util::BytesRange;
 use crate::sst_iter::SstIterator;
 use crate::tablestore::TableStore;
 use crate::types::KeyValueDeletable;
 
-pub(crate) struct SortedRunIterator<'a> {
-    current_iter: Option<SstIterator<'a>>,
-    sorted_run_iter: Iter<'a, SsTableHandle>,
+pub(crate) struct SortedRunIterator<'a, H: AsRef<SsTableHandle> = &'a SsTableHandle> {
+    current_iter: Option<SstIterator<'a, H>>,
+    sorted_run_iter: SsTableHandleIter<'a, H>,
     table_store: Arc<TableStore>,
     blocks_to_fetch: usize,
     blocks_to_buffer: usize,
     cache_blocks: bool,
 }
 
-impl<'a> SortedRunIterator<'a> {
+pub(crate) struct SsTableHandleIter<'a, H: AsRef<SsTableHandle> = &'a SsTableHandle> {
+    vec: VecDeque<H>,
+    _marker: PhantomData<&'a H>
+}
+
+impl<'a, H: AsRef<SsTableHandle>> SsTableHandleIter<'a, H> {
+
+    fn new(vec: VecDeque<H>) -> Self {
+        Self { vec, _marker: PhantomData }
+    }
+
+    pub(crate) fn next(&mut self) -> Option<H> {
+        self.vec.pop_front()
+    }
+}
+
+impl<'a> SortedRunIterator<'a, Arc<SsTableHandle>> {
+    pub(crate) async fn new_from_range(
+        sorted_run: SortedRun,
+        range: &BytesRange,
+        table_store: Arc<TableStore>,
+        max_fetch_tasks: usize,
+        blocks_to_fetch: usize,
+        cache_blocks: bool,
+    ) -> Result<Self, SlateDBError> {
+        assert!(!sorted_run.ssts.is_empty());
+        let ssts = sorted_run.into_tables_covering_range(range);
+        let sorted_run_iter = SsTableHandleIter::new(ssts);
+
+        Ok(Self::new_from_iter(
+            sorted_run_iter,
+            None,
+            table_store,
+            max_fetch_tasks,
+            blocks_to_fetch,
+            true,
+            cache_blocks
+        ).await?)
+    }
+}
+
+impl<'a> SortedRunIterator<'a, &'a SsTableHandle> {
     pub(crate) async fn new_from_key(
         sorted_run: &'a SortedRun,
         key: &'a [u8],
@@ -87,22 +129,53 @@ impl<'a> SortedRunIterator<'a> {
         spawn: bool,
         cache_blocks: bool,
     ) -> Result<Self, SlateDBError> {
-        let mut sorted_run_iter = from_key
-            .map(|from_key| Self::find_iter_from_key(from_key, sorted_run))
-            .unwrap_or(sorted_run.ssts.iter());
+        let sorted_run_iter = Self::find_iter_from_key(from_key, sorted_run);
+        Ok(Self::new_from_iter(
+            sorted_run_iter,
+            from_key,
+            table_store,
+            max_fetch_tasks,
+            blocks_to_fetch,
+            spawn,
+            cache_blocks
+        ).await?)
+    }
+
+    fn find_iter_from_key(
+        from_key: Option<&[u8]>,
+        sorted_run: &'a SortedRun,
+    ) -> SsTableHandleIter<'a, &'a SsTableHandle> {
+        let sorted_runs = from_key
+            .map(|key| sorted_run.find_sst_with_range_covering_key_idx(key))
+            .flatten()
+            .map(|idx| sorted_run.ssts[idx..].iter())
+            .unwrap_or(sorted_run.ssts.iter())
+            .collect();
+        SsTableHandleIter::new(sorted_runs)
+    }
+}
+
+impl<'a, H: AsRef<SsTableHandle>> SortedRunIterator<'a, H> {
+    async fn new_from_iter(
+        mut sorted_run_iter: SsTableHandleIter<'a, H>,
+        from_key: Option<&'a [u8]>,
+        table_store: Arc<TableStore>,
+        max_fetch_tasks: usize,
+        blocks_to_fetch: usize,
+        spawn: bool,
+        cache_blocks: bool,
+    ) -> Result<Self, SlateDBError> {
         let current_iter = match sorted_run_iter.next() {
             None => None,
-            Some(h) => Some(
-                SstIterator::new_opts(
-                    h,
-                    from_key,
-                    table_store.clone(),
-                    max_fetch_tasks,
-                    blocks_to_fetch,
-                    spawn,
-                    cache_blocks,
-                )
-                .await?,
+            Some(h) => Some(SstIterator::new_opts(
+                h,
+                from_key,
+                table_store.clone(),
+                max_fetch_tasks,
+                blocks_to_fetch,
+                spawn,
+                cache_blocks,
+            ).await?
             ),
         };
         Ok(Self {
@@ -114,19 +187,9 @@ impl<'a> SortedRunIterator<'a> {
             cache_blocks,
         })
     }
-
-    pub(crate) fn find_iter_from_key(
-        key: &[u8],
-        sorted_run: &'a SortedRun,
-    ) -> Iter<'a, SsTableHandle> {
-        match sorted_run.find_sst_with_range_covering_key_idx(key) {
-            None => sorted_run.ssts.iter(),
-            Some(idx) => sorted_run.ssts[idx..].iter(),
-        }
-    }
 }
 
-impl<'a> KeyValueIterator for SortedRunIterator<'a> {
+impl<'a, H: AsRef<SsTableHandle>> KeyValueIterator for SortedRunIterator<'a, H> {
     async fn next_entry(&mut self) -> Result<Option<KeyValueDeletable>, SlateDBError> {
         loop {
             if let Some(iter) = &mut self.current_iter {

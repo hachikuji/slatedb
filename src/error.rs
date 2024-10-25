@@ -55,6 +55,9 @@ pub enum SlateDBError {
 
     #[error("Unknown RowFlags -- this may be caused by reading data encoded with a newer codec")]
     InvalidRowFlags,
+
+    #[error("Invalidated Iterator -- TODO")]
+    InvalidatedIterator,
 }
 
 /// Represents errors that can occur during the database configuration.

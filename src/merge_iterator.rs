@@ -1,6 +1,5 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, VecDeque};
-
 use crate::error::SlateDBError;
 use crate::iter::KeyValueIterator;
 use crate::types::KeyValueDeletable;
@@ -11,6 +10,7 @@ pub(crate) struct TwoMergeIterator<T1: KeyValueIterator, T2: KeyValueIterator> {
 }
 
 impl<T1: KeyValueIterator, T2: KeyValueIterator> TwoMergeIterator<T1, T2> {
+
     pub(crate) async fn new(mut iterator1: T1, mut iterator2: T2) -> Result<Self, SlateDBError> {
         let next1 = iterator1.next_entry().await?;
         let next2 = iterator2.next_entry().await?;
@@ -40,7 +40,6 @@ impl<T1: KeyValueIterator, T2: KeyValueIterator> TwoMergeIterator<T1, T2> {
         ))
     }
 }
-
 impl<T1: KeyValueIterator, T2: KeyValueIterator> KeyValueIterator for TwoMergeIterator<T1, T2> {
     async fn next_entry(&mut self) -> Result<Option<KeyValueDeletable>, SlateDBError> {
         if let Some(next1) = self.iterator1.1.as_ref() {

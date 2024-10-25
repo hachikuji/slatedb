@@ -13,17 +13,16 @@ use crate::batch_write::{WriteBatchMsg, WriteBatchRequest};
 use crate::cached_object_store::CachedObjectStore;
 use crate::compactor::Compactor;
 use crate::config::ReadLevel::Uncommitted;
-use crate::config::{
-    DbOptions, ReadOptions, WriteOptions, DEFAULT_READ_OPTIONS, DEFAULT_WRITE_OPTIONS,
-};
+use crate::config::{DbOptions, ReadOptions, ScanOptions, WriteOptions, DEFAULT_READ_OPTIONS, DEFAULT_SCAN_OPTIONS, DEFAULT_WRITE_OPTIONS};
 use crate::db_state::{CoreDbState, DbState, SortedRun, SsTableHandle, SsTableId};
+use crate::db_iter::DbIterator;
 use crate::error::SlateDBError;
-use crate::filter;
+use crate::{filter, range_util};
 use crate::flush::WalFlushThreadMsg;
 use crate::garbage_collector::GarbageCollector;
 use crate::iter::KeyValueIterator;
 use crate::manifest_store::{FenceableManifest, ManifestStore, StoredManifest};
-use crate::mem_table::WritableKVTable;
+use crate::mem_table::{MaterializedIterator, WritableKVTable};
 use crate::mem_table_flush::MemtableFlushThreadMsg;
 use crate::metrics::DbStats;
 use crate::sorted_run_iterator::SortedRunIterator;
@@ -32,6 +31,7 @@ use crate::sst_iter::SstIterator;
 use crate::tablestore::TableStore;
 use crate::types::{RowAttributes, ValueDeletable};
 use std::rc::Rc;
+use crate::range_util::BytesRange;
 
 pub(crate) struct DbInner {
     pub(crate) state: Arc<RwLock<DbState>>,
@@ -108,7 +108,7 @@ impl DbInner {
         }
         for sr in &snapshot.state.core.compacted {
             if self.sr_might_include_key(sr, key, key_hash).await? {
-                let mut iter =
+                let mut iter: SortedRunIterator<&SsTableHandle> =
                     SortedRunIterator::new_from_key(sr, key, self.table_store.clone(), 1, 1, true) // cache blocks
                         .await?;
                 if let Some(entry) = iter.next_entry().await? {
@@ -119,6 +119,70 @@ impl DbInner {
             }
         }
         Ok(None)
+    }
+
+    pub async fn scan_with_options<'a>(
+        &'a self,
+        range: &'a BytesRange,
+        options: &ScanOptions,
+    ) -> Result<DbIterator, SlateDBError> {
+        let snapshot = Arc::new(self.state.read().snapshot());
+        let mut memtables = VecDeque::new();
+
+        if matches!(options.read_level, Uncommitted) {
+            memtables.push_back(snapshot.wal.clone());
+            for imm_wal in &snapshot.state.imm_wal {
+                memtables.push_back(imm_wal.table());
+            }
+        }
+
+        memtables.push_back(snapshot.memtable.clone());
+        for memtable in &snapshot.state.imm_memtable {
+            memtables.push_back(memtable.table());
+        }
+
+        let mem_iter = MaterializedIterator::from_range(
+            memtables,
+            range,
+        ).await?;
+
+        let state = snapshot.state.as_ref().clone();
+        let start_key = range_util::start_bound(range);
+
+        let mut l0_iters = VecDeque::new();
+        for sst in state.core.l0 {
+            let iter = SstIterator::new_opts(
+                Arc::new(sst),
+                start_key,
+                self.table_store.clone(),
+                1,
+                1, // TODO: Convert bytes to blocks
+                true,
+                options.cache_blocks,
+            ).await?;
+            l0_iters.push_back(iter);
+        }
+
+        let mut sr_iters: VecDeque<SortedRunIterator<Arc<SsTableHandle>>> = VecDeque::new();
+        for sr in state.core.compacted {
+            let sorted_run_iter = SortedRunIterator::new_from_range(
+                sr,
+                &range,
+                self.table_store.clone(),
+                1,
+                1,
+                options.cache_blocks
+            ).await?;
+            sr_iters.push_back(sorted_run_iter);
+        }
+
+        DbIterator::new(
+            snapshot,
+            range,
+            mem_iter,
+            l0_iters,
+            sr_iters,
+        ).await
     }
 
     async fn fence_writers(
@@ -656,6 +720,20 @@ impl Db {
         self.inner.get_with_options(key, options).await
     }
 
+    pub async fn scan<'a>(
+        &'a self,
+        range: &'a BytesRange,
+    ) -> Result<DbIterator, SlateDBError> {
+        self.inner.scan_with_options(range, DEFAULT_SCAN_OPTIONS).await
+    }
+    pub async fn scan_with_options<'a>(
+        &'a self,
+        range: &'a BytesRange,
+        options: &ScanOptions,
+    ) -> Result<DbIterator, SlateDBError> {
+        self.inner.scan_with_options(range, options).await
+    }
+
     pub async fn put(&self, key: &[u8], value: &[u8]) {
         // TODO move the put into an async block by blocking on the memtable flush
         self.inner
@@ -712,6 +790,7 @@ impl Db {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::Bound;
     use std::time::Duration;
 
     use futures::{future::join_all, StreamExt};
@@ -720,9 +799,7 @@ mod tests {
     use tracing::info;
 
     use super::*;
-    use crate::config::{
-        CompactorOptions, ObjectStoreCacheOptions, SizeTieredCompactionSchedulerOptions,
-    };
+    use crate::config::{CompactorOptions, DbRecord, ObjectStoreCacheOptions, SizeTieredCompactionSchedulerOptions};
     use crate::size_tiered_compaction::SizeTieredCompactionSchedulerSupplier;
     use crate::sst_iter::SstIterator;
     #[cfg(feature = "wal_disable")]
@@ -871,6 +948,96 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn test_scan_returns_records_in_order() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Db::open_with_opts(
+            Path::from("/tmp/test_kv_store"),
+            test_db_options(0, 1024, None),
+            object_store,
+        ).await.unwrap();
+
+        db.put("bbb".as_bytes(), "222".as_bytes()).await;
+        db.put("aaa".as_bytes(), "111".as_bytes()).await;
+        db.put("ccc".as_bytes(), "333".as_bytes()).await;
+
+        let range = BytesRange::unbounded();
+        let mut iter = db.scan(&range).await.unwrap();
+
+        assert_eq!(Some(DbRecord::from_str("aaa", "111")), iter.next().await.unwrap());
+        assert_eq!(Some(DbRecord::from_str("bbb", "222")), iter.next().await.unwrap());
+        assert_eq!(Some(DbRecord::from_str("ccc", "333")), iter.next().await.unwrap());
+        assert_eq!(None, iter.next().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_scan_returns_records_in_range_with_start_bound() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Db::open_with_opts(
+            Path::from("/tmp/test_kv_store"),
+            test_db_options(0, 1024, None),
+            object_store,
+        ).await.unwrap();
+
+        db.put("bbb".as_bytes(), "222".as_bytes()).await;
+        db.put("aaa".as_bytes(), "111".as_bytes()).await;
+        db.put("ccc".as_bytes(), "333".as_bytes()).await;
+
+        let start_key = Bytes::copy_from_slice("bbb".as_bytes());
+        let range = BytesRange::with_start_bound(Bound::Included(start_key));
+        let mut iter = db.scan(&range).await.unwrap();
+
+        assert_eq!(Some(DbRecord::from_str("bbb", "222")), iter.next().await.unwrap());
+        assert_eq!(Some(DbRecord::from_str("ccc", "333")), iter.next().await.unwrap());
+        assert_eq!(None, iter.next().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_scan_returns_records_in_range_with_end_bound() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Db::open_with_opts(
+            Path::from("/tmp/test_kv_store"),
+            test_db_options(0, 1024, None),
+            object_store,
+        ).await.unwrap();
+
+        db.put("bbb".as_bytes(), "222".as_bytes()).await;
+        db.put("aaa".as_bytes(), "111".as_bytes()).await;
+        db.put("ccc".as_bytes(), "333".as_bytes()).await;
+
+        let end_key = Bytes::copy_from_slice("bbb".as_bytes());
+        let range = BytesRange::with_end_bound(Bound::Included(end_key));
+        let mut iter = db.scan(&range).await.unwrap();
+
+        assert_eq!(Some(DbRecord::from_str("aaa", "111")), iter.next().await.unwrap());
+        assert_eq!(Some(DbRecord::from_str("bbb", "222")), iter.next().await.unwrap());
+        assert_eq!(None, iter.next().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_scan_returns_records_from_l0() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Db::open_with_opts(
+            Path::from("/tmp/test_kv_store"),
+            test_db_options(0, 1024, None),
+            object_store,
+        ).await.unwrap();
+
+        db.put("bbb".as_bytes(), "222".as_bytes()).await;
+        db.put("aaa".as_bytes(), "111".as_bytes()).await;
+        db.put("ccc".as_bytes(), "333".as_bytes()).await;
+        db.flush().await.unwrap();
+
+        let range = BytesRange::unbounded();
+        let mut iter = db.scan(&range).await.unwrap();
+
+        assert_eq!(Some(DbRecord::from_str("aaa", "111")), iter.next().await.unwrap());
+        assert_eq!(Some(DbRecord::from_str("bbb", "222")), iter.next().await.unwrap());
+        assert_eq!(Some(DbRecord::from_str("ccc", "333")), iter.next().await.unwrap());
+        assert_eq!(None, iter.next().await.unwrap());
+    }
+
 
     #[tokio::test]
     async fn test_write_batch() {
