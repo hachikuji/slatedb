@@ -445,6 +445,7 @@ mod tests {
 
             assert!(covering_tables.len() > 0);
 
+            // TODO: I think we can improve these assertions using contains
             let first_covering_table = covering_tables.front().unwrap();
             let range_start_key = range.start_bound_opt().unwrap_or(Bytes::new());
             if let Some(first_key) = &first_covering_table.info.first_key {
@@ -460,7 +461,7 @@ mod tests {
                 assert!(*first_key <= range_end_key);
             } else if sorted_run.ssts.len() > 1 {
                 let second_table = sorted_run.ssts[1].clone();
-                assert!(second_table.info.first_key.unwrap() > range_end_key);
+                assert!(!range.contains(&second_table.info.first_key.unwrap()));
             }
         });
     }

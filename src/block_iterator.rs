@@ -93,6 +93,7 @@ impl<B: BlockLike> BlockIterator<B> {
 
     /// Construct a BlockIterator that starts at the given key, or at the first
     /// key greater than the given key if the exact key given is not in the block.
+    /// TODO: Only used in tests now that we have seek. Can we drop?
     pub async fn from_key(block: B, key: &[u8]) -> Result<BlockIterator<B>, SlateDBError> {
         let mut iter = Self::from_first_key(block);
         let seek_key = Bytes::copy_from_slice(key);

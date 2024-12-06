@@ -15,6 +15,7 @@ use crate::{
     block::Block, block_iterator::BlockIterator, iter::KeyValueIterator, tablestore::TableStore,
     types::RowEntry,
 };
+use crate::block_iterator::BlockLike;
 
 enum FetchTask {
     InFlight(JoinHandle<Result<VecDeque<Arc<Block>>, SlateDBError>>),
@@ -29,7 +30,6 @@ pub(crate) struct SstIterator<'a, H: AsRef<SsTableHandle> = &'a SsTableHandle> {
     table: H,
     index: Arc<SsTableIndexOwned>,
     current_iter: Option<BlockIterator<Arc<Block>>>,
-    range: BytesRange,
     next_block_idx_to_fetch: usize,
     fetch_tasks: VecDeque<FetchTask>,
     max_fetch_tasks: usize,
@@ -205,14 +205,7 @@ impl<'a, H: AsRef<SsTableHandle>> SstIterator<'a, H> {
                     }
                     FetchTask::Finished(blocks) => {
                         if let Some(block) = blocks.pop_front() {
-                            let start_bound = self.range.start_bound();
-                            let iter = match start_bound {
-                                Unbounded => BlockIterator::from_first_key(block),
-                                Included(key) | Excluded(key) => {
-                                    BlockIterator::from_key(block, key).await?
-                                }
-                            };
-                            return Ok(Some(iter));
+                            return Ok(Some(BlockIterator::from_first_key(block)));
                         } else {
                             self.fetch_tasks.pop_front();
                         }
@@ -234,42 +227,40 @@ impl<'a, H: AsRef<SsTableHandle>> SstIterator<'a, H> {
     }
 
     fn end_iteration(&mut self) {
+    }
+
+    async fn current(&mut self) -> Result<Option<&mut BlockIterator<Arc<Block>>>, SlateDBError> {
+        let next_iter = if let Some(current_iter) = self.current_iter.as_mut() {
+            Some(current_iter)
+        } else if let Some(next_iter) = self.next_iter() {
+            Some(self.current_iter.insert(next_iter))
+        } else {
+            None
+        };
+        Ok(next_iter)
+    }
+
+    async fn advance(&mut self) {
+        self.current_iter = None;
+    }
+
+    async fn stop(&mut self) {
         let num_blocks = self.index.borrow().block_meta().len();
         self.next_block_idx_to_fetch = num_blocks;
-        self.current_iter = None
+        self.current_iter = None;
     }
 }
 
 impl<'a, H: AsRef<SsTableHandle>> KeyValueIterator for SstIterator<'a, H> {
     async fn next_entry(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
         loop {
-            let current_iter = if let Some(current_iter) = self.current_iter.as_mut() {
-                current_iter
-            } else if let Some(next_iter) = self.next_iter().await? {
-                self.current_iter.insert(next_iter)
-            } else {
-                return Ok(None);
+            let Some(current_iter) = self.current().await? else {
+                return Ok(None)
             };
 
-            let kv = current_iter.next_entry().await?;
-            match kv {
-                Some(kv) if self.range.contains(&kv.key) => return Ok(Some(kv)),
-                Some(kv) => match self.range.end_bound() {
-                    Unbounded => continue,
-                    Included(end_key) | Excluded(end_key) => {
-                        if kv.key > end_key {
-                            self.end_iteration();
-                            return Ok(None);
-                        } else {
-                            continue;
-                        }
-                    }
-                },
-                None => {
-                    self.current_iter = None;
-                    // We have exhausted the current block, but not necessarily the entire SST,
-                    // so we fall back to the top to check if we have more blocks to read.
-                }
+            match current_iter.next_entry().await? {
+                Some(kv) => return Ok(Some(kv)),
+                None => self.advance(),
             }
         }
     }
@@ -277,11 +268,6 @@ impl<'a, H: AsRef<SsTableHandle>> KeyValueIterator for SstIterator<'a, H> {
 
 impl<'a, H: AsRef<SsTableHandle>> SeekToKey for SstIterator<'a, H> {
     async fn seek(&mut self, next_key: &Bytes) -> Result<(), SlateDBError> {
-        if !self.range_covers_key(next_key) {
-            self.end_iteration();
-            return Ok(());
-        }
-
         loop {
             let current_iter = if let Some(current_iter) = self.current_iter.as_mut() {
                 current_iter
@@ -295,6 +281,84 @@ impl<'a, H: AsRef<SsTableHandle>> SeekToKey for SstIterator<'a, H> {
                 self.current_iter = None;
             } else {
                 return Ok(());
+            }
+        }
+    }
+}
+
+struct RangedSstIterator<'a, H: AsRef<SsTableHandle> = &'a SsTableHandle> {
+    range: BytesRange,
+    sst_iter: SstIterator<'a, H>,
+}
+
+impl<'a, H: AsRef<SsTableHandle>> KeyValueIterator for RangedSstIterator<'a, H> {
+    async fn next_entry(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+        loop {
+            let Some(current_iter) = self.sst_iter.current().await? else {
+                return Ok(None)
+            };
+
+            match current_iter.next_entry().await? {
+                Some(kv) if self.range.contains(&kv.key) => return Ok(Some(kv)),
+                Some(kv) => {
+                    if let Some(start_key) = self.range.start_bound() {
+                        if kv.key < start_key {
+                            current_iter.seek(start_key).await?
+                        }
+                    }
+
+                    if let Some(end_key) = self.range.end_bound() {
+                        if kv.key > end_key {
+                            self.sst_iter.end_iteration();
+                            return Ok(None);
+                        } else {
+                            continue;
+                        }
+                    }
+                },
+                None => self.sst_iter.advance(),
+            }
+        }
+    }
+}
+
+impl<'a, H: AsRef<SsTableHandle>> SeekToKey for RangedSstIterator<'a, H> {
+    async fn seek(&mut self, next_key: &Bytes) -> Result<(), SlateDBError> {
+        if !self.range_covers_key(next_key) {
+            self.end_iteration();
+            Ok(())
+        } else {
+            self.sst_iter.seek(next_key).await
+        }
+    }
+}
+
+struct KeyedSstIterator<'a, H: AsRef<SsTableHandle> = &'a SsTableHandle> {
+    key: &'a [u8],
+    sst_iter: SstIterator<'a, H>,
+}
+
+impl<'a, H: AsRef<SsTableHandle>> KeyValueIterator for KeyedSstIterator<'a, H> {
+    async fn next_entry(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+        loop {
+            let Some(current_iter) = self.sst_iter.current().await? else {
+                return Ok(None)
+            };
+
+            match current_iter.next_entry().await? {
+                Some(kv) if kv.key == self.key => return Ok(Some(kv)),
+                Some(kv) => {
+                    if kv.key < self.key {
+                        let bytes_key = Bytes::copy_from_slice(self.key);
+                        current_iter.seek(&bytes_key).await?;
+                    }
+
+                    if kv.key > self.key {
+                        self.sst_iter.end_iteration();
+                        return Ok(None);
+                    }
+                }
+                None => self.sst_iter.advance(),
             }
         }
     }
