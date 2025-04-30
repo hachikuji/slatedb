@@ -1,10 +1,11 @@
 use crate::manifest_store::ManifestStore;
 use object_store::path::Path;
-use object_store::ObjectStore;
+use object_store::{ClientOptions, ObjectStore};
 use std::env;
 use std::error::Error;
 use std::ops::RangeBounds;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// read-only access to the latest manifest file
 pub async fn read_manifest(
@@ -73,13 +74,15 @@ pub fn load_aws() -> Result<Arc<dyn ObjectStore>, Box<dyn Error>> {
         env::var("AWS_SECRET_ACCESS_KEY").expect("Expected AWS_SECRET_ACCESS_KEY must be set");
     let bucket = env::var("AWS_BUCKET").expect("AWS_BUCKET must be set");
     let region = env::var("AWS_REGION").expect("AWS_REGION must be set");
-
     Ok(Arc::new(
         object_store::aws::AmazonS3Builder::new()
             .with_access_key_id(key)
             .with_secret_access_key(secret)
             .with_bucket_name(bucket)
             .with_region(region)
+            .with_client_options(ClientOptions::new()
+                .with_connect_timeout(Duration::from_secs(30 * 60))
+                .with_timeout(Duration::from_secs(30 * 60)))
             .build()?,
     ) as Arc<dyn ObjectStore>)
 }
