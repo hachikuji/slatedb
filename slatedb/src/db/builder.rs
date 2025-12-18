@@ -102,6 +102,7 @@
 //! ```
 //!
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use fail_parallel::FailPointRegistry;
@@ -156,6 +157,34 @@ use crate::stats::StatRegistry;
 use crate::tablestore::TableStore;
 use crate::utils::WatchableOnceCell;
 
+mod compactor_mode {
+    pub trait Sealed {}
+}
+
+pub(crate) trait CompactorMode: compactor_mode::Sealed {}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Standalone;
+impl compactor_mode::Sealed for Standalone {}
+impl CompactorMode for Standalone {}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Embedded;
+impl compactor_mode::Sealed for Embedded {}
+impl CompactorMode for Embedded {}
+
+/// Runtime context for standalone compactors.
+/// Embedded compactors inherit this from the parent Db.
+struct RuntimeContext {
+    path: Path,
+    main_object_store: Arc<dyn ObjectStore>,
+    stat_registry: Arc<StatRegistry>,
+    system_clock: Arc<dyn SystemClock>,
+    rand: Arc<DbRand>,
+    merge_operator: Option<MergeOperatorType>,
+    closed_result: WatchableOnceCell<Result<(), SlateDBError>>,
+}
+
 /// A builder for creating a new Db instance.
 ///
 /// This builder provides a fluent API for configuring and opening a SlateDB database.
@@ -169,8 +198,7 @@ pub struct DbBuilder<P: Into<Path>> {
     logical_clock: Option<Arc<dyn LogicalClock>>,
     system_clock: Option<Arc<dyn SystemClock>>,
     gc_runtime: Option<Handle>,
-    compaction_runtime: Option<Handle>,
-    compaction_scheduler_supplier: Option<Arc<dyn CompactionSchedulerSupplier>>,
+    compactor_builder: Option<CompactorBuilder<Embedded>>,
     fp_registry: Arc<FailPointRegistry>,
     seed: Option<u64>,
     sst_block_size: Option<SstBlockSize>,
@@ -180,17 +208,21 @@ pub struct DbBuilder<P: Into<Path>> {
 impl<P: Into<Path>> DbBuilder<P> {
     /// Creates a new builder for a database at the given path.
     pub fn new(path: P, main_object_store: Arc<dyn ObjectStore>) -> Self {
+        let settings = Settings::default();
+        let compactor_builder = settings
+            .compactor_options
+            .clone()
+            .map(|options| CompactorBuilder::embedded().with_options(options));
         Self {
             path,
             main_object_store,
-            settings: Settings::default(),
+            settings,
             wal_object_store: None,
             memory_cache: None,
             logical_clock: None,
             system_clock: None,
             gc_runtime: None,
-            compaction_runtime: None,
-            compaction_scheduler_supplier: None,
+            compactor_builder,
             fp_registry: Arc::new(FailPointRegistry::new()),
             seed: None,
             sst_block_size: None,
@@ -200,6 +232,10 @@ impl<P: Into<Path>> DbBuilder<P> {
 
     /// Sets the database settings.
     pub fn with_settings(mut self, settings: Settings) -> Self {
+        self.compactor_builder = settings
+            .compactor_options
+            .clone()
+            .map(|options| CompactorBuilder::embedded().with_options(options));
         self.settings = settings;
         self
     }
@@ -243,9 +279,18 @@ impl<P: Into<Path>> DbBuilder<P> {
         self
     }
 
-    /// Sets the compaction runtime to use for the database.
+    /// Configures the embedded compactor for this database.
+    pub fn with_compactor(mut self, compactor: CompactorBuilder<Embedded>) -> Self {
+        self.compactor_builder = Some(compactor);
+        self
+    }
+
     pub fn with_compaction_runtime(mut self, compaction_runtime: Handle) -> Self {
-        self.compaction_runtime = Some(compaction_runtime);
+        let compactor = self
+            .compactor_builder
+            .take()
+            .expect("cannot configure compaction runtime when compactor is disabled (compactor_options is None)");
+        self.compactor_builder = Some(compactor.with_runtime(compaction_runtime));
         self
     }
 
@@ -253,7 +298,12 @@ impl<P: Into<Path>> DbBuilder<P> {
         mut self,
         compaction_scheduler_supplier: Arc<dyn CompactionSchedulerSupplier>,
     ) -> Self {
-        self.compaction_scheduler_supplier = Some(compaction_scheduler_supplier);
+        let compactor = self
+            .compactor_builder
+            .take()
+            .expect("cannot configure compaction scheduler when compactor is disabled (compactor_options is None)");
+        self.compactor_builder =
+            Some(compactor.with_scheduler_supplier(compaction_scheduler_supplier));
         self
     }
 
@@ -536,16 +586,13 @@ impl<P: Into<Path>> DbBuilder<P> {
             None,
         ));
 
-        // To keep backwards compatibility, check if the compaction_scheduler_supplier or compactor_options are set.
-        // If either are set, we need to initialize the compactor.
-        if self.compaction_scheduler_supplier.is_some() || self.settings.compactor_options.is_some()
-        {
-            let compactor_options = Arc::new(self.settings.compactor_options.unwrap_or_default());
-            let compaction_handle = self
+        if let Some(builder) = self.compactor_builder {
+            let compactor_options = Arc::new(builder.options);
+            let compaction_handle = builder
                 .compaction_runtime
                 .unwrap_or_else(|| tokio_handle.clone());
-            let scheduler_supplier = self
-                .compaction_scheduler_supplier
+            let scheduler_supplier = builder
+                .scheduler_supplier
                 .unwrap_or_else(default_compaction_scheduler_supplier);
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let scheduler = Arc::from(scheduler_supplier.compaction_scheduler(&compactor_options));
@@ -754,103 +801,86 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
     }
 }
 
-/// Builder for creating new Compactor instances.
+/// Builder for creating Compactor instances.
 ///
-/// This provides a fluent API for configuring a Compactor object.
-pub struct CompactorBuilder<P: Into<Path>> {
-    path: P,
-    main_object_store: Arc<dyn ObjectStore>,
-    compaction_runtime: Handle,
+/// Supports two modes via the type-state pattern:
+/// - [`Standalone`]: Full configuration for standalone compactor processes
+/// - [`Embedded`]: Limited configuration for compactors embedded in a Db
+#[allow(private_bounds)]
+pub struct CompactorBuilder<M: CompactorMode = Standalone> {
+    _mode: PhantomData<M>,
+    runtime_context: Option<RuntimeContext>,
+    compaction_runtime: Option<Handle>,
     options: CompactorOptions,
     scheduler_supplier: Option<Arc<dyn CompactionSchedulerSupplier>>,
-    rand: Arc<DbRand>,
-    stat_registry: Arc<StatRegistry>,
-    system_clock: Arc<dyn SystemClock>,
-    closed_result: WatchableOnceCell<Result<(), SlateDBError>>,
-    merge_operator: Option<MergeOperatorType>,
 }
 
-#[allow(unused)]
-impl<P: Into<Path>> CompactorBuilder<P> {
-    pub fn new(path: P, main_object_store: Arc<dyn ObjectStore>) -> Self {
+impl CompactorBuilder<Standalone> {
+    pub fn standalone(path: impl Into<Path>, main_object_store: Arc<dyn ObjectStore>) -> Self {
         Self {
-            path,
-            main_object_store,
-            compaction_runtime: Handle::current(),
+            _mode: PhantomData,
+            runtime_context: Some(RuntimeContext {
+                path: path.into(),
+                main_object_store,
+                stat_registry: Arc::new(StatRegistry::new()),
+                system_clock: Arc::new(DefaultSystemClock::default()),
+                rand: Arc::new(DbRand::default()),
+                merge_operator: None,
+                closed_result: WatchableOnceCell::new(),
+            }),
+            compaction_runtime: None,
             options: CompactorOptions::default(),
             scheduler_supplier: None,
-            rand: Arc::new(DbRand::default()),
-            stat_registry: Arc::new(StatRegistry::new()),
-            system_clock: Arc::new(DefaultSystemClock::default()),
-            closed_result: WatchableOnceCell::new(),
-            merge_operator: None,
         }
     }
 
-    /// Sets the tokio handle to use for background tasks.
-    #[allow(unused)]
-    pub fn with_runtime(mut self, compaction_runtime: Handle) -> Self {
-        self.compaction_runtime = compaction_runtime;
-        self
-    }
-
-    /// Sets the options to use for the compactor.
-    pub fn with_options(mut self, options: CompactorOptions) -> Self {
-        self.options = options;
-        self
-    }
-
-    /// Sets the stats registry to use for the compactor.
     #[allow(unused)]
     pub fn with_stat_registry(mut self, stat_registry: Arc<StatRegistry>) -> Self {
-        self.stat_registry = stat_registry;
+        if let Some(ctx) = &mut self.runtime_context {
+            ctx.stat_registry = stat_registry;
+        }
         self
     }
 
-    /// Sets the system clock to use for the compactor.
     pub fn with_system_clock(mut self, system_clock: Arc<dyn SystemClock>) -> Self {
-        self.system_clock = system_clock;
+        if let Some(ctx) = &mut self.runtime_context {
+            ctx.system_clock = system_clock;
+        }
         self
     }
 
-    /// Sets the random number generator to use for the compactor.
     pub fn with_seed(mut self, seed: u64) -> Self {
-        self.rand = Arc::new(DbRand::new(seed));
+        if let Some(ctx) = &mut self.runtime_context {
+            ctx.rand = Arc::new(DbRand::new(seed));
+        }
         self
     }
 
-    /// Sets the compaction scheduler supplier to use for the compactor.
-    pub fn with_scheduler_supplier(
-        mut self,
-        scheduler_supplier: Arc<dyn CompactionSchedulerSupplier>,
-    ) -> Self {
-        self.scheduler_supplier = Some(scheduler_supplier);
-        self
-    }
-
-    /// Sets the merge operator to use for the compactor.
     pub fn with_merge_operator(mut self, merge_operator: MergeOperatorType) -> Self {
-        self.merge_operator = Some(merge_operator);
+        if let Some(ctx) = &mut self.runtime_context {
+            ctx.merge_operator = Some(merge_operator);
+        }
         self
     }
 
-    /// Builds and returns a Compactor instance.
     pub fn build(self) -> Compactor {
-        let path: Path = self.path.into();
-        let retrying_main_object_store = Arc::new(RetryingObjectStore::new(self.main_object_store));
+        let ctx = self
+            .runtime_context
+            .expect("runtime context required for standalone compactor");
+        let retrying_main_object_store = Arc::new(RetryingObjectStore::new(ctx.main_object_store));
         let manifest_store = Arc::new(ManifestStore::new(
-            &path,
+            &ctx.path,
             retrying_main_object_store.clone(),
         ));
         let compactions_store = Arc::new(CompactionsStore::new(
-            &path,
+            &ctx.path,
             retrying_main_object_store.clone(),
         ));
         let table_store = Arc::new(TableStore::new(
             ObjectStores::new(retrying_main_object_store.clone(), None),
-            SsTableFormat::default(), // read only SSTs can use default
-            path,
-            None, // no need for cache in GC
+            SsTableFormat::default(),
+            ctx.path,
+            None,
         ));
 
         let scheduler_supplier = self
@@ -863,13 +893,46 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             table_store,
             self.options,
             scheduler_supplier,
-            self.compaction_runtime,
-            self.rand,
-            self.stat_registry,
-            self.system_clock,
-            self.closed_result,
-            self.merge_operator,
+            self.compaction_runtime.unwrap_or_else(Handle::current),
+            ctx.rand,
+            ctx.stat_registry,
+            ctx.system_clock,
+            ctx.closed_result,
+            ctx.merge_operator,
         )
+    }
+}
+
+impl CompactorBuilder<Embedded> {
+    pub fn embedded() -> Self {
+        Self {
+            _mode: PhantomData,
+            runtime_context: None,
+            compaction_runtime: None,
+            options: CompactorOptions::default(),
+            scheduler_supplier: None,
+        }
+    }
+}
+
+#[allow(private_bounds)]
+impl<M: CompactorMode> CompactorBuilder<M> {
+    pub fn with_runtime(mut self, compaction_runtime: Handle) -> Self {
+        self.compaction_runtime = Some(compaction_runtime);
+        self
+    }
+
+    pub fn with_options(mut self, options: CompactorOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    pub fn with_scheduler_supplier(
+        mut self,
+        scheduler_supplier: Arc<dyn CompactionSchedulerSupplier>,
+    ) -> Self {
+        self.scheduler_supplier = Some(scheduler_supplier);
+        self
     }
 }
 

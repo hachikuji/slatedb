@@ -12,7 +12,7 @@ use slatedb::config::{
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::ObjectStore;
 use slatedb::size_tiered_compaction::SizeTieredCompactionSchedulerSupplier;
-use slatedb::Db;
+use slatedb::{CompactorBuilder, Db};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -265,4 +265,61 @@ async fn test_concurrent_writers_and_readers() {
         })
         .await
         .expect("Failed to close DB after retries");
+}
+
+#[tokio::test]
+async fn test_with_compactor_embedded_builder() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+    let compactor_options = CompactorOptions {
+        poll_interval: Duration::from_millis(100),
+        ..Default::default()
+    };
+    let scheduler_supplier = Arc::new(SizeTieredCompactionSchedulerSupplier::new(
+        SizeTieredCompactionSchedulerOptions {
+            min_compaction_sources: 1,
+            ..Default::default()
+        },
+    ));
+
+    let settings = Settings {
+        l0_sst_size_bytes: 128,
+        ..Default::default()
+    };
+
+    // Test that with_compactor() works with embedded builder
+    let db = Db::builder("/test_with_compactor", object_store)
+        .with_settings(settings)
+        .with_compactor(
+            CompactorBuilder::embedded()
+                .with_options(compactor_options)
+                .with_scheduler_supplier(scheduler_supplier),
+        )
+        .build()
+        .await
+        .expect("Failed to build DB with embedded compactor");
+
+    // Write data and verify it's readable
+    for i in 0..10u8 {
+        let key = vec![b'k', i];
+        let value = vec![b'v'; 64];
+        db.put(&key, &value).await.expect("Failed to put");
+    }
+    db.flush().await.expect("Failed to flush");
+
+    // Give compactor time to run (it should be active with our config)
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Verify all data is still readable
+    for i in 0..10u8 {
+        let key = vec![b'k', i];
+        let value = db
+            .get(&key)
+            .await
+            .expect("Failed to get")
+            .expect("Key should exist");
+        assert_eq!(value.as_ref(), vec![b'v'; 64].as_slice());
+    }
+
+    db.close().await.expect("Failed to close DB");
 }

@@ -3955,7 +3955,11 @@ mod tests {
             move |_state| this_should_compact_l0.swap(false, Ordering::SeqCst),
         )));
         let db = Db::builder(path, object_store.clone())
-            .with_settings(test_db_options(0, 1024 * 1024, None))
+            .with_settings(test_db_options(
+                0,
+                1024 * 1024,
+                Some(CompactorOptions::default()),
+            ))
             .with_merge_operator(Arc::new(StringConcatMergeOperator {}))
             .with_compaction_scheduler_supplier(compaction_scheduler)
             .build()
