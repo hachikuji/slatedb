@@ -41,7 +41,7 @@ pub(crate) struct MemtableFlusher {
 }
 
 const MAX_BUILD_IN_FLIGHT: usize = 1;
-const MAX_UPLOAD_IN_FLIGHT: usize = 2;
+const MAX_UPLOAD_IN_FLIGHT: usize = 1;
 
 struct PendingBuiltFlush {
     flush_seq: u64,
@@ -49,6 +49,7 @@ struct PendingBuiltFlush {
     sst_id: SsTableId,
     flush_start: Instant,
     wal_wait_elapsed_ms: u64,
+    built_at: Instant,
     built: crate::flush::BuiltImmTable,
 }
 
@@ -61,6 +62,9 @@ struct ReadyForCommit {
     flush_stats: crate::flush::FlushImmTableStats,
     flush_start: Instant,
     wal_wait_elapsed_ms: u64,
+    built_at: Instant,
+    upload_started_at: Instant,
+    uploaded_at: Instant,
     last_seq: u64,
 }
 
@@ -242,6 +246,7 @@ impl MemtableFlusher {
                         sst_id,
                         flush_start,
                         wal_wait_elapsed_ms,
+                        built_at: Instant::now(),
                         built,
                     })
                 });
@@ -254,6 +259,7 @@ impl MemtableFlusher {
                         .expect("pending build exists");
                     let db_inner = Arc::clone(&self.db_inner);
                     upload_tasks.spawn(async move {
+                        let upload_started_at = Instant::now();
                         let last_seq = pending
                             .imm_memtable
                             .table()
@@ -271,6 +277,9 @@ impl MemtableFlusher {
                             flush_stats,
                             flush_start: pending.flush_start,
                             wal_wait_elapsed_ms: pending.wal_wait_elapsed_ms,
+                            built_at: pending.built_at,
+                            upload_started_at,
+                            uploaded_at: Instant::now(),
                             last_seq,
                         })
                     });
@@ -531,6 +540,27 @@ impl MemtableFlusher {
             .db_stats
             .l0_flush_input_bytes
             .add(ready.imm_memtable.table().metadata().entries_size_in_bytes as u64);
+        let upload_queue_ms = ready
+            .upload_started_at
+            .saturating_duration_since(ready.built_at)
+            .as_millis() as u64;
+        self.db_inner
+            .db_stats
+            .l0_flush_upload_queue_ms
+            .add(upload_queue_ms);
+        self.db_inner
+            .db_stats
+            .l0_flush_upload_queue_ms_last
+            .set(upload_queue_ms);
+        let commit_queue_ms = ready.uploaded_at.elapsed().as_millis() as u64;
+        self.db_inner
+            .db_stats
+            .l0_flush_commit_queue_ms
+            .add(commit_queue_ms);
+        self.db_inner
+            .db_stats
+            .l0_flush_commit_queue_ms_last
+            .set(commit_queue_ms);
         self.db_inner
             .db_stats
             .l0_flush_publish_ms

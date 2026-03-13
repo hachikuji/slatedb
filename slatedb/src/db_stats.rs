@@ -59,6 +59,10 @@ pub const L0_FLUSH_PUT_MS: &str = db_stat_name!("l0_flush_put_ms");
 pub const L0_FLUSH_PUT_MS_LAST: &str = db_stat_name!("l0_flush_put_ms_last");
 pub const L0_FLUSH_CACHE_MS: &str = db_stat_name!("l0_flush_cache_ms");
 pub const L0_FLUSH_CACHE_MS_LAST: &str = db_stat_name!("l0_flush_cache_ms_last");
+pub const L0_FLUSH_UPLOAD_QUEUE_MS: &str = db_stat_name!("l0_flush_upload_queue_ms");
+pub const L0_FLUSH_UPLOAD_QUEUE_MS_LAST: &str = db_stat_name!("l0_flush_upload_queue_ms_last");
+pub const L0_FLUSH_COMMIT_QUEUE_MS: &str = db_stat_name!("l0_flush_commit_queue_ms");
+pub const L0_FLUSH_COMMIT_QUEUE_MS_LAST: &str = db_stat_name!("l0_flush_commit_queue_ms_last");
 pub const L0_FLUSH_PUBLISH_MS: &str = db_stat_name!("l0_flush_publish_ms");
 pub const L0_FLUSH_PUBLISH_MS_LAST: &str = db_stat_name!("l0_flush_publish_ms_last");
 pub const L0_FLUSH_MANIFEST_MS: &str = db_stat_name!("l0_flush_manifest_ms");
@@ -130,6 +134,10 @@ pub(crate) struct DbStats {
     pub(crate) l0_flush_put_ms_last: Arc<Gauge<u64>>,
     pub(crate) l0_flush_cache_ms: Arc<Counter>,
     pub(crate) l0_flush_cache_ms_last: Arc<Gauge<u64>>,
+    pub(crate) l0_flush_upload_queue_ms: Arc<Counter>,
+    pub(crate) l0_flush_upload_queue_ms_last: Arc<Gauge<u64>>,
+    pub(crate) l0_flush_commit_queue_ms: Arc<Counter>,
+    pub(crate) l0_flush_commit_queue_ms_last: Arc<Gauge<u64>>,
     pub(crate) l0_flush_publish_ms: Arc<Counter>,
     pub(crate) l0_flush_publish_ms_last: Arc<Gauge<u64>>,
     pub(crate) l0_flush_manifest_ms: Arc<Counter>,
@@ -202,6 +210,10 @@ impl DbStats {
             l0_flush_put_ms_last: Arc::new(Gauge::default()),
             l0_flush_cache_ms: Arc::new(Counter::default()),
             l0_flush_cache_ms_last: Arc::new(Gauge::default()),
+            l0_flush_upload_queue_ms: Arc::new(Counter::default()),
+            l0_flush_upload_queue_ms_last: Arc::new(Gauge::default()),
+            l0_flush_commit_queue_ms: Arc::new(Counter::default()),
+            l0_flush_commit_queue_ms_last: Arc::new(Gauge::default()),
             l0_flush_publish_ms: Arc::new(Counter::default()),
             l0_flush_publish_ms_last: Arc::new(Gauge::default()),
             l0_flush_manifest_ms: Arc::new(Counter::default()),
@@ -321,6 +333,22 @@ impl DbStats {
         registry.register(L0_FLUSH_PUT_MS_LAST, stats.l0_flush_put_ms_last.clone());
         registry.register(L0_FLUSH_CACHE_MS, stats.l0_flush_cache_ms.clone());
         registry.register(L0_FLUSH_CACHE_MS_LAST, stats.l0_flush_cache_ms_last.clone());
+        registry.register(
+            L0_FLUSH_UPLOAD_QUEUE_MS,
+            stats.l0_flush_upload_queue_ms.clone(),
+        );
+        registry.register(
+            L0_FLUSH_UPLOAD_QUEUE_MS_LAST,
+            stats.l0_flush_upload_queue_ms_last.clone(),
+        );
+        registry.register(
+            L0_FLUSH_COMMIT_QUEUE_MS,
+            stats.l0_flush_commit_queue_ms.clone(),
+        );
+        registry.register(
+            L0_FLUSH_COMMIT_QUEUE_MS_LAST,
+            stats.l0_flush_commit_queue_ms_last.clone(),
+        );
         registry.register(L0_FLUSH_PUBLISH_MS, stats.l0_flush_publish_ms.clone());
         registry.register(
             L0_FLUSH_PUBLISH_MS_LAST,
