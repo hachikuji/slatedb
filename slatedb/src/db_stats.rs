@@ -8,6 +8,21 @@ macro_rules! db_stat_name {
 }
 
 pub const IMMUTABLE_MEMTABLE_FLUSHES: &str = db_stat_name!("immutable_memtable_flushes");
+pub const WAL_FLUSH_TOTAL_MS: &str = db_stat_name!("wal_flush_total_ms");
+pub const WAL_FLUSH_TOTAL_MS_LAST: &str = db_stat_name!("wal_flush_total_ms_last");
+pub const WAL_FLUSH_ROW_LOOP_MS: &str = db_stat_name!("wal_flush_row_loop_ms");
+pub const WAL_FLUSH_ROW_LOOP_MS_LAST: &str = db_stat_name!("wal_flush_row_loop_ms_last");
+pub const WAL_FLUSH_BUILD_MS: &str = db_stat_name!("wal_flush_build_ms");
+pub const WAL_FLUSH_BUILD_MS_LAST: &str = db_stat_name!("wal_flush_build_ms_last");
+pub const WAL_FLUSH_PUT_MS: &str = db_stat_name!("wal_flush_put_ms");
+pub const WAL_FLUSH_PUT_MS_LAST: &str = db_stat_name!("wal_flush_put_ms_last");
+pub const WAL_FLUSH_CACHE_MS: &str = db_stat_name!("wal_flush_cache_ms");
+pub const WAL_FLUSH_CACHE_MS_LAST: &str = db_stat_name!("wal_flush_cache_ms_last");
+pub const WAL_FLUSH_INPUT_ROWS_LAST: &str = db_stat_name!("wal_flush_input_rows_last");
+pub const WAL_FLUSH_INPUT_BYTES: &str = db_stat_name!("wal_flush_input_bytes");
+pub const WAL_FLUSH_INPUT_BYTES_LAST: &str = db_stat_name!("wal_flush_input_bytes_last");
+pub const WAL_FLUSH_OUTPUT_BYTES: &str = db_stat_name!("wal_flush_output_bytes");
+pub const WAL_FLUSH_OUTPUT_BYTES_LAST: &str = db_stat_name!("wal_flush_output_bytes_last");
 pub const SST_FILTER_FALSE_POSITIVES: &str = db_stat_name!("sst_filter_false_positives");
 pub const SST_FILTER_POSITIVES: &str = db_stat_name!("sst_filter_positives");
 pub const SST_FILTER_NEGATIVES: &str = db_stat_name!("sst_filter_negatives");
@@ -59,6 +74,21 @@ pub const L0_FLUSH_MANIFEST_RETRIES: &str = db_stat_name!("l0_flush_manifest_ret
 #[derive(Clone, Debug)]
 pub(crate) struct DbStats {
     pub(crate) immutable_memtable_flushes: Arc<Counter>,
+    pub(crate) wal_flush_total_ms: Arc<Counter>,
+    pub(crate) wal_flush_total_ms_last: Arc<Gauge<u64>>,
+    pub(crate) wal_flush_row_loop_ms: Arc<Counter>,
+    pub(crate) wal_flush_row_loop_ms_last: Arc<Gauge<u64>>,
+    pub(crate) wal_flush_build_ms: Arc<Counter>,
+    pub(crate) wal_flush_build_ms_last: Arc<Gauge<u64>>,
+    pub(crate) wal_flush_put_ms: Arc<Counter>,
+    pub(crate) wal_flush_put_ms_last: Arc<Gauge<u64>>,
+    pub(crate) wal_flush_cache_ms: Arc<Counter>,
+    pub(crate) wal_flush_cache_ms_last: Arc<Gauge<u64>>,
+    pub(crate) wal_flush_input_rows_last: Arc<Gauge<u64>>,
+    pub(crate) wal_flush_input_bytes: Arc<Counter>,
+    pub(crate) wal_flush_input_bytes_last: Arc<Gauge<u64>>,
+    pub(crate) wal_flush_output_bytes: Arc<Counter>,
+    pub(crate) wal_flush_output_bytes_last: Arc<Gauge<u64>>,
     pub(crate) wal_buffer_estimated_bytes: Arc<Gauge<i64>>,
     pub(crate) wal_buffer_flushes: Arc<Counter>,
     pub(crate) sst_filter_false_positives: Arc<Counter>,
@@ -111,6 +141,21 @@ impl DbStats {
     pub(crate) fn new(registry: &StatRegistry) -> DbStats {
         let stats = Self {
             immutable_memtable_flushes: Arc::new(Counter::default()),
+            wal_flush_total_ms: Arc::new(Counter::default()),
+            wal_flush_total_ms_last: Arc::new(Gauge::default()),
+            wal_flush_row_loop_ms: Arc::new(Counter::default()),
+            wal_flush_row_loop_ms_last: Arc::new(Gauge::default()),
+            wal_flush_build_ms: Arc::new(Counter::default()),
+            wal_flush_build_ms_last: Arc::new(Gauge::default()),
+            wal_flush_put_ms: Arc::new(Counter::default()),
+            wal_flush_put_ms_last: Arc::new(Gauge::default()),
+            wal_flush_cache_ms: Arc::new(Counter::default()),
+            wal_flush_cache_ms_last: Arc::new(Gauge::default()),
+            wal_flush_input_rows_last: Arc::new(Gauge::default()),
+            wal_flush_input_bytes: Arc::new(Counter::default()),
+            wal_flush_input_bytes_last: Arc::new(Gauge::default()),
+            wal_flush_output_bytes: Arc::new(Counter::default()),
+            wal_flush_output_bytes_last: Arc::new(Gauge::default()),
             wal_buffer_estimated_bytes: Arc::new(Gauge::default()),
             wal_buffer_flushes: Arc::new(Counter::default()),
             sst_filter_false_positives: Arc::new(Counter::default()),
@@ -161,6 +206,42 @@ impl DbStats {
         registry.register(
             IMMUTABLE_MEMTABLE_FLUSHES,
             stats.immutable_memtable_flushes.clone(),
+        );
+        registry.register(WAL_FLUSH_TOTAL_MS, stats.wal_flush_total_ms.clone());
+        registry.register(
+            WAL_FLUSH_TOTAL_MS_LAST,
+            stats.wal_flush_total_ms_last.clone(),
+        );
+        registry.register(WAL_FLUSH_ROW_LOOP_MS, stats.wal_flush_row_loop_ms.clone());
+        registry.register(
+            WAL_FLUSH_ROW_LOOP_MS_LAST,
+            stats.wal_flush_row_loop_ms_last.clone(),
+        );
+        registry.register(WAL_FLUSH_BUILD_MS, stats.wal_flush_build_ms.clone());
+        registry.register(
+            WAL_FLUSH_BUILD_MS_LAST,
+            stats.wal_flush_build_ms_last.clone(),
+        );
+        registry.register(WAL_FLUSH_PUT_MS, stats.wal_flush_put_ms.clone());
+        registry.register(WAL_FLUSH_PUT_MS_LAST, stats.wal_flush_put_ms_last.clone());
+        registry.register(WAL_FLUSH_CACHE_MS, stats.wal_flush_cache_ms.clone());
+        registry.register(
+            WAL_FLUSH_CACHE_MS_LAST,
+            stats.wal_flush_cache_ms_last.clone(),
+        );
+        registry.register(
+            WAL_FLUSH_INPUT_ROWS_LAST,
+            stats.wal_flush_input_rows_last.clone(),
+        );
+        registry.register(WAL_FLUSH_INPUT_BYTES, stats.wal_flush_input_bytes.clone());
+        registry.register(
+            WAL_FLUSH_INPUT_BYTES_LAST,
+            stats.wal_flush_input_bytes_last.clone(),
+        );
+        registry.register(WAL_FLUSH_OUTPUT_BYTES, stats.wal_flush_output_bytes.clone());
+        registry.register(
+            WAL_FLUSH_OUTPUT_BYTES_LAST,
+            stats.wal_flush_output_bytes_last.clone(),
         );
         registry.register(
             WAL_BUFFER_ESTIMATED_BYTES,

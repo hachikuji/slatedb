@@ -189,6 +189,7 @@ impl TableStore {
         self.sst_format.wal_table_builder()
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn write_sst(
         &self,
         id: &SsTableId,

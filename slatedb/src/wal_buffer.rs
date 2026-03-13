@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use futures::{stream::BoxStream, StreamExt};
@@ -356,19 +357,51 @@ impl WalBufferManager {
 
     async fn do_flush_one_wal(&self, wal_id: u64, wal: Arc<WalBuffer>) -> Result<(), SlateDBError> {
         self.db_stats.wal_buffer_flushes.inc();
+        let total_start = Instant::now();
+        self.db_stats
+            .wal_flush_input_rows_last
+            .set(wal.len() as u64);
+        self.db_stats.wal_flush_input_bytes.add(wal.size() as u64);
+        self.db_stats
+            .wal_flush_input_bytes_last
+            .set(wal.size() as u64);
 
         let mut sst_builder = self.table_store.wal_table_builder();
         let (mut iter, last_tick) = (wal.iter(), wal.last_tick());
+        let row_loop_start = Instant::now();
         while let Some(entry) = iter.next() {
             sst_builder.add(entry).await?;
         }
+        let row_loop_ms = row_loop_start.elapsed().as_millis() as u64;
+        self.db_stats.wal_flush_row_loop_ms.add(row_loop_ms);
+        self.db_stats.wal_flush_row_loop_ms_last.set(row_loop_ms);
 
+        let build_start = Instant::now();
         let encoded_sst = sst_builder.build().await?;
-        self.table_store
-            .write_sst(&SsTableId::Wal(wal_id), encoded_sst, false)
+        let build_ms = build_start.elapsed().as_millis() as u64;
+        self.db_stats.wal_flush_build_ms.add(build_ms);
+        self.db_stats.wal_flush_build_ms_last.set(build_ms);
+
+        let output_bytes = encoded_sst.info.index_offset + encoded_sst.info.index_len;
+        self.db_stats.wal_flush_output_bytes.add(output_bytes);
+        self.db_stats.wal_flush_output_bytes_last.set(output_bytes);
+
+        let (handle, write_stats) = self
+            .table_store
+            .write_sst_with_stats(&SsTableId::Wal(wal_id), encoded_sst, false)
             .await?;
+        self.db_stats.wal_flush_put_ms.add(write_stats.put_ms);
+        self.db_stats.wal_flush_put_ms_last.set(write_stats.put_ms);
+        self.db_stats.wal_flush_cache_ms.add(write_stats.cache_ms);
+        self.db_stats
+            .wal_flush_cache_ms_last
+            .set(write_stats.cache_ms);
+        let total_ms = total_start.elapsed().as_millis() as u64;
+        self.db_stats.wal_flush_total_ms.add(total_ms);
+        self.db_stats.wal_flush_total_ms_last.set(total_ms);
 
         self.mono_clock.fetch_max_last_durable_tick(last_tick);
+        let _ = handle;
         Ok(())
     }
 
