@@ -10,6 +10,7 @@ use log::{debug, warn};
 use object_store::buffered::BufWriter;
 use object_store::path::Path;
 use object_store::{ObjectStore, PutMode, PutOptions};
+use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
 
@@ -35,6 +36,12 @@ pub(crate) struct TableStore {
     fp_registry: Arc<FailPointRegistry>,
     /// In-memory cache for data blocks, indices, and filters
     cache: Option<Arc<dyn DbCache>>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct WriteSstStats {
+    pub(crate) put_ms: u64,
+    pub(crate) cache_ms: u64,
 }
 
 struct ReadOnlyObject {
@@ -188,6 +195,17 @@ impl TableStore {
         encoded_sst: EncodedSsTable,
         write_cache: bool,
     ) -> Result<SsTableHandle, SlateDBError> {
+        self.write_sst_with_stats(id, encoded_sst, write_cache)
+            .await
+            .map(|(handle, _)| handle)
+    }
+
+    pub(crate) async fn write_sst_with_stats(
+        &self,
+        id: &SsTableId,
+        encoded_sst: EncodedSsTable,
+        write_cache: bool,
+    ) -> Result<(SsTableHandle, WriteSstStats), SlateDBError> {
         fail_point!(
             self.fp_registry.clone(),
             "write-wal-sst-io-error",
@@ -204,8 +222,11 @@ impl TableStore {
         let object_store = self.object_stores.store_for(id);
         let data = encoded_sst.remaining_as_bytes();
         let path = self.path(id);
+        let put_start = Instant::now();
         write_sst_in_object_store(object_store.clone(), id, &path, &data).await?;
+        let put_ms = put_start.elapsed().as_millis() as u64;
 
+        let cache_start = Instant::now();
         if let Some(ref cache) = self.cache {
             if write_cache {
                 for block in encoded_sst.unconsumed_blocks {
@@ -225,10 +246,10 @@ impl TableStore {
         }
         self.cache_filter(*id, encoded_sst.info.filter_offset, encoded_sst.filter)
             .await;
-        Ok(SsTableHandle::new(
-            *id,
-            encoded_sst.format_version,
-            encoded_sst.info,
+        let cache_ms = cache_start.elapsed().as_millis() as u64;
+        Ok((
+            SsTableHandle::new(*id, encoded_sst.format_version, encoded_sst.info),
+            WriteSstStats { put_ms, cache_ms },
         ))
     }
 

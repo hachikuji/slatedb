@@ -11,6 +11,18 @@ use crate::retention_iterator::RetentionIterator;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct FlushImmTableStats {
+    pub(crate) iter_setup_ms: u64,
+    pub(crate) row_loop_ms: u64,
+    pub(crate) finish_block_ms: u64,
+    pub(crate) footer_ms: u64,
+    pub(crate) put_ms: u64,
+    pub(crate) cache_ms: u64,
+    pub(crate) encode_ms: u64,
+    pub(crate) write_ms: u64,
+}
+
 impl DbInner {
     pub(crate) async fn flush_imm_table(
         &self,
@@ -18,20 +30,35 @@ impl DbInner {
         imm_table: Arc<KVTable>,
         write_cache: bool,
     ) -> Result<SsTableHandle, SlateDBError> {
+        self.flush_imm_table_with_stats(id, imm_table, write_cache)
+            .await
+            .map(|(handle, _)| handle)
+    }
+
+    pub(crate) async fn flush_imm_table_with_stats(
+        &self,
+        id: &db_state::SsTableId,
+        imm_table: Arc<KVTable>,
+        write_cache: bool,
+    ) -> Result<(SsTableHandle, FlushImmTableStats), SlateDBError> {
         let mut sst_builder = self.table_store.table_builder();
+        let iter_setup_start = Instant::now();
         let mut iter = self.iter_imm_table(imm_table.clone()).await?;
+        let iter_setup_ms = iter_setup_start.elapsed().as_millis() as u64;
         let encode_start = Instant::now();
+        let row_loop_start = Instant::now();
         while let Some(entry) = iter.next().await? {
             sst_builder.add(entry).await?;
         }
-        let encoded_sst = sst_builder.build().await?;
+        let row_loop_ms = row_loop_start.elapsed().as_millis() as u64;
+        let (encoded_sst, build_stats) = sst_builder.build_with_stats().await?;
         let encode_elapsed = encode_start.elapsed();
         self.db_inner_stats_update_encode(encode_elapsed.as_millis() as u64);
 
         let write_start = Instant::now();
-        let handle = self
+        let (handle, write_stats) = self
             .table_store
-            .write_sst(id, encoded_sst, write_cache)
+            .write_sst_with_stats(id, encoded_sst, write_cache)
             .await?;
         let write_elapsed = write_start.elapsed();
         self.db_inner_stats_update_write(write_elapsed.as_millis() as u64);
@@ -39,7 +66,19 @@ impl DbInner {
         self.mono_clock
             .fetch_max_last_durable_tick(imm_table.last_tick());
 
-        Ok(handle)
+        Ok((
+            handle,
+            FlushImmTableStats {
+                iter_setup_ms,
+                row_loop_ms,
+                finish_block_ms: build_stats.finish_block_ms,
+                footer_ms: build_stats.footer_ms,
+                put_ms: write_stats.put_ms,
+                cache_ms: write_stats.cache_ms,
+                encode_ms: encode_elapsed.as_millis() as u64,
+                write_ms: write_elapsed.as_millis() as u64,
+            },
+        ))
     }
 
     async fn iter_imm_table(
@@ -87,12 +126,12 @@ impl DbInner {
 }
 
 impl DbInner {
-    fn db_inner_stats_update_encode(&self, elapsed_ms: u64) {
+    pub(crate) fn db_inner_stats_update_encode(&self, elapsed_ms: u64) {
         self.db_stats.l0_flush_encode_ms.add(elapsed_ms);
         self.db_stats.l0_flush_encode_ms_last.set(elapsed_ms);
     }
 
-    fn db_inner_stats_update_write(&self, elapsed_ms: u64) {
+    pub(crate) fn db_inner_stats_update_write(&self, elapsed_ms: u64) {
         self.db_stats.l0_flush_write_ms.add(elapsed_ms);
         self.db_stats.l0_flush_write_ms_last.set(elapsed_ms);
     }

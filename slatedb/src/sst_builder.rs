@@ -69,6 +69,13 @@ use crate::utils::compute_index_key;
 use crate::BlockTransformer;
 use bytes::Bytes;
 use flatbuffers::DefaultAllocator;
+use std::time::Instant;
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct EncodedSsTableBuildStats {
+    pub(crate) finish_block_ms: u64,
+    pub(crate) footer_ms: u64,
+}
 
 /// SST block format version.
 ///
@@ -265,10 +272,18 @@ impl EncodedSsTableBuilder<'_> {
     }
 
     async fn finish_block(&mut self) -> Result<Option<usize>, SlateDBError> {
+        self.finish_block_with_stats(None).await
+    }
+
+    async fn finish_block_with_stats(
+        &mut self,
+        stats: Option<&mut EncodedSsTableBuildStats>,
+    ) -> Result<Option<usize>, SlateDBError> {
         if self.is_drained() {
             return Ok(None);
         }
 
+        let start = Instant::now();
         let new_builder = self.new_block_builder();
         let builder = std::mem::replace(&mut self.builder, new_builder);
         let mut block_builder = EncodedSsTableBlockBuilder::new(builder, self.current_len);
@@ -292,6 +307,9 @@ impl EncodedSsTableBuilder<'_> {
         self.current_len += block_size as u64;
         self.blocks.push_back(block);
         self.first_key = None;
+        if let Some(stats) = stats {
+            stats.finish_block_ms += start.elapsed().as_millis() as u64;
+        }
 
         Ok(Some(block_size))
     }
@@ -327,10 +345,18 @@ impl EncodedSsTableBuilder<'_> {
     /// +---------------------------------------------------+
     /// * Only present if num_keys >= min_filter_keys.
     ///
-    pub(crate) async fn build(mut self) -> Result<EncodedSsTable, SlateDBError> {
-        self.finish_block().await?;
+    pub(crate) async fn build(self) -> Result<EncodedSsTable, SlateDBError> {
+        self.build_with_stats().await.map(|(sst, _)| sst)
+    }
+
+    pub(crate) async fn build_with_stats(
+        mut self,
+    ) -> Result<(EncodedSsTable, EncodedSsTableBuildStats), SlateDBError> {
+        let mut stats = EncodedSsTableBuildStats::default();
+        self.finish_block_with_stats(Some(&mut stats)).await?;
 
         // Build footer (includes index building)
+        let footer_start = Instant::now();
         let mut footer_builder = EncodedSsTableFooterBuilder::new(
             self.current_len,
             self.sst_first_key,
@@ -356,15 +382,19 @@ impl EncodedSsTableBuilder<'_> {
         }
 
         let footer = footer_builder.build().await?;
+        stats.footer_ms = footer_start.elapsed().as_millis() as u64;
 
-        Ok(EncodedSsTable {
-            format_version: self.sst_format_version,
-            info: footer.info,
-            index: footer.index,
-            filter: footer.filter,
-            unconsumed_blocks: self.blocks,
-            footer: footer.encoded_bytes,
-        })
+        Ok((
+            EncodedSsTable {
+                format_version: self.sst_format_version,
+                info: footer.info,
+                index: footer.index,
+                filter: footer.filter,
+                unconsumed_blocks: self.blocks,
+                footer: footer.encoded_bytes,
+            },
+            stats,
+        ))
     }
 
     pub(crate) fn is_drained(&self) -> bool {

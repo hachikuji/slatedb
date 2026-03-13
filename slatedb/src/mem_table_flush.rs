@@ -163,10 +163,58 @@ impl MemtableFlusher {
                     .rng()
                     .gen_ulid(self.db_inner.system_clock.as_ref()),
             );
-            let sst_handle = self
+            let (sst_handle, flush_stats) = self
                 .db_inner
-                .flush_imm_table(&id, imm_memtable.table(), true)
+                .flush_imm_table_with_stats(&id, imm_memtable.table(), true)
                 .await?;
+            self.db_inner
+                .db_stats
+                .l0_flush_iter_setup_ms
+                .add(flush_stats.iter_setup_ms);
+            self.db_inner
+                .db_stats
+                .l0_flush_iter_setup_ms_last
+                .set(flush_stats.iter_setup_ms);
+            self.db_inner
+                .db_stats
+                .l0_flush_row_loop_ms
+                .add(flush_stats.row_loop_ms);
+            self.db_inner
+                .db_stats
+                .l0_flush_row_loop_ms_last
+                .set(flush_stats.row_loop_ms);
+            self.db_inner
+                .db_stats
+                .l0_flush_finish_block_ms
+                .add(flush_stats.finish_block_ms);
+            self.db_inner
+                .db_stats
+                .l0_flush_finish_block_ms_last
+                .set(flush_stats.finish_block_ms);
+            self.db_inner
+                .db_stats
+                .l0_flush_footer_ms
+                .add(flush_stats.footer_ms);
+            self.db_inner
+                .db_stats
+                .l0_flush_footer_ms_last
+                .set(flush_stats.footer_ms);
+            self.db_inner
+                .db_stats
+                .l0_flush_put_ms
+                .add(flush_stats.put_ms);
+            self.db_inner
+                .db_stats
+                .l0_flush_put_ms_last
+                .set(flush_stats.put_ms);
+            self.db_inner
+                .db_stats
+                .l0_flush_cache_ms
+                .add(flush_stats.cache_ms);
+            self.db_inner
+                .db_stats
+                .l0_flush_cache_ms_last
+                .set(flush_stats.cache_ms);
             fail_point!(
                 Arc::clone(&self.db_inner.fp_registry),
                 "after-flush-imm-to-l0-before-manifest"
@@ -268,13 +316,19 @@ impl MemtableFlusher {
                         .l0_flush_total_ms_last
                         .set(total_elapsed_ms);
                     debug!(
-                        "flushed imm memtable to l0 [rows={}, input_bytes={}, output_bytes={}, wal_wait_ms={}, encode_ms={}, write_ms={}, publish_ms={}, manifest_ms={}, total_ms={}, sst_id={:?}]",
+                        "flushed imm memtable to l0 [rows={}, input_bytes={}, output_bytes={}, wal_wait_ms={}, iter_setup_ms={}, row_loop_ms={}, finish_block_ms={}, footer_ms={}, encode_ms={}, put_ms={}, cache_ms={}, write_ms={}, publish_ms={}, manifest_ms={}, total_ms={}, sst_id={:?}]",
                         metadata.entry_num,
                         metadata.entries_size_in_bytes,
                         output_bytes,
                         wal_wait_elapsed_ms,
-                        self.db_inner.db_stats.l0_flush_encode_ms_last.value(),
-                        self.db_inner.db_stats.l0_flush_write_ms_last.value(),
+                        flush_stats.iter_setup_ms,
+                        flush_stats.row_loop_ms,
+                        flush_stats.finish_block_ms,
+                        flush_stats.footer_ms,
+                        flush_stats.encode_ms,
+                        flush_stats.put_ms,
+                        flush_stats.cache_ms,
+                        flush_stats.write_ms,
                         publish_elapsed_ms,
                         manifest_elapsed_ms,
                         total_elapsed_ms,

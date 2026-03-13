@@ -30,8 +30,20 @@ pub const L0_FLUSH_WAL_WAIT_MS: &str = db_stat_name!("l0_flush_wal_wait_ms");
 pub const L0_FLUSH_WAL_WAIT_MS_LAST: &str = db_stat_name!("l0_flush_wal_wait_ms_last");
 pub const L0_FLUSH_ENCODE_MS: &str = db_stat_name!("l0_flush_encode_ms");
 pub const L0_FLUSH_ENCODE_MS_LAST: &str = db_stat_name!("l0_flush_encode_ms_last");
+pub const L0_FLUSH_ITER_SETUP_MS: &str = db_stat_name!("l0_flush_iter_setup_ms");
+pub const L0_FLUSH_ITER_SETUP_MS_LAST: &str = db_stat_name!("l0_flush_iter_setup_ms_last");
+pub const L0_FLUSH_ROW_LOOP_MS: &str = db_stat_name!("l0_flush_row_loop_ms");
+pub const L0_FLUSH_ROW_LOOP_MS_LAST: &str = db_stat_name!("l0_flush_row_loop_ms_last");
+pub const L0_FLUSH_FINISH_BLOCK_MS: &str = db_stat_name!("l0_flush_finish_block_ms");
+pub const L0_FLUSH_FINISH_BLOCK_MS_LAST: &str = db_stat_name!("l0_flush_finish_block_ms_last");
+pub const L0_FLUSH_FOOTER_MS: &str = db_stat_name!("l0_flush_footer_ms");
+pub const L0_FLUSH_FOOTER_MS_LAST: &str = db_stat_name!("l0_flush_footer_ms_last");
 pub const L0_FLUSH_WRITE_MS: &str = db_stat_name!("l0_flush_write_ms");
 pub const L0_FLUSH_WRITE_MS_LAST: &str = db_stat_name!("l0_flush_write_ms_last");
+pub const L0_FLUSH_PUT_MS: &str = db_stat_name!("l0_flush_put_ms");
+pub const L0_FLUSH_PUT_MS_LAST: &str = db_stat_name!("l0_flush_put_ms_last");
+pub const L0_FLUSH_CACHE_MS: &str = db_stat_name!("l0_flush_cache_ms");
+pub const L0_FLUSH_CACHE_MS_LAST: &str = db_stat_name!("l0_flush_cache_ms_last");
 pub const L0_FLUSH_PUBLISH_MS: &str = db_stat_name!("l0_flush_publish_ms");
 pub const L0_FLUSH_PUBLISH_MS_LAST: &str = db_stat_name!("l0_flush_publish_ms_last");
 pub const L0_FLUSH_MANIFEST_MS: &str = db_stat_name!("l0_flush_manifest_ms");
@@ -69,8 +81,20 @@ pub(crate) struct DbStats {
     pub(crate) l0_flush_wal_wait_ms_last: Arc<Gauge<u64>>,
     pub(crate) l0_flush_encode_ms: Arc<Counter>,
     pub(crate) l0_flush_encode_ms_last: Arc<Gauge<u64>>,
+    pub(crate) l0_flush_iter_setup_ms: Arc<Counter>,
+    pub(crate) l0_flush_iter_setup_ms_last: Arc<Gauge<u64>>,
+    pub(crate) l0_flush_row_loop_ms: Arc<Counter>,
+    pub(crate) l0_flush_row_loop_ms_last: Arc<Gauge<u64>>,
+    pub(crate) l0_flush_finish_block_ms: Arc<Counter>,
+    pub(crate) l0_flush_finish_block_ms_last: Arc<Gauge<u64>>,
+    pub(crate) l0_flush_footer_ms: Arc<Counter>,
+    pub(crate) l0_flush_footer_ms_last: Arc<Gauge<u64>>,
     pub(crate) l0_flush_write_ms: Arc<Counter>,
     pub(crate) l0_flush_write_ms_last: Arc<Gauge<u64>>,
+    pub(crate) l0_flush_put_ms: Arc<Counter>,
+    pub(crate) l0_flush_put_ms_last: Arc<Gauge<u64>>,
+    pub(crate) l0_flush_cache_ms: Arc<Counter>,
+    pub(crate) l0_flush_cache_ms_last: Arc<Gauge<u64>>,
     pub(crate) l0_flush_publish_ms: Arc<Counter>,
     pub(crate) l0_flush_publish_ms_last: Arc<Gauge<u64>>,
     pub(crate) l0_flush_manifest_ms: Arc<Counter>,
@@ -109,8 +133,20 @@ impl DbStats {
             l0_flush_wal_wait_ms_last: Arc::new(Gauge::default()),
             l0_flush_encode_ms: Arc::new(Counter::default()),
             l0_flush_encode_ms_last: Arc::new(Gauge::default()),
+            l0_flush_iter_setup_ms: Arc::new(Counter::default()),
+            l0_flush_iter_setup_ms_last: Arc::new(Gauge::default()),
+            l0_flush_row_loop_ms: Arc::new(Counter::default()),
+            l0_flush_row_loop_ms_last: Arc::new(Gauge::default()),
+            l0_flush_finish_block_ms: Arc::new(Counter::default()),
+            l0_flush_finish_block_ms_last: Arc::new(Gauge::default()),
+            l0_flush_footer_ms: Arc::new(Counter::default()),
+            l0_flush_footer_ms_last: Arc::new(Gauge::default()),
             l0_flush_write_ms: Arc::new(Counter::default()),
             l0_flush_write_ms_last: Arc::new(Gauge::default()),
+            l0_flush_put_ms: Arc::new(Counter::default()),
+            l0_flush_put_ms_last: Arc::new(Gauge::default()),
+            l0_flush_cache_ms: Arc::new(Counter::default()),
+            l0_flush_cache_ms_last: Arc::new(Gauge::default()),
             l0_flush_publish_ms: Arc::new(Counter::default()),
             l0_flush_publish_ms_last: Arc::new(Gauge::default()),
             l0_flush_manifest_ms: Arc::new(Counter::default()),
@@ -160,8 +196,35 @@ impl DbStats {
             L0_FLUSH_ENCODE_MS_LAST,
             stats.l0_flush_encode_ms_last.clone(),
         );
+        registry.register(L0_FLUSH_ITER_SETUP_MS, stats.l0_flush_iter_setup_ms.clone());
+        registry.register(
+            L0_FLUSH_ITER_SETUP_MS_LAST,
+            stats.l0_flush_iter_setup_ms_last.clone(),
+        );
+        registry.register(L0_FLUSH_ROW_LOOP_MS, stats.l0_flush_row_loop_ms.clone());
+        registry.register(
+            L0_FLUSH_ROW_LOOP_MS_LAST,
+            stats.l0_flush_row_loop_ms_last.clone(),
+        );
+        registry.register(
+            L0_FLUSH_FINISH_BLOCK_MS,
+            stats.l0_flush_finish_block_ms.clone(),
+        );
+        registry.register(
+            L0_FLUSH_FINISH_BLOCK_MS_LAST,
+            stats.l0_flush_finish_block_ms_last.clone(),
+        );
+        registry.register(L0_FLUSH_FOOTER_MS, stats.l0_flush_footer_ms.clone());
+        registry.register(
+            L0_FLUSH_FOOTER_MS_LAST,
+            stats.l0_flush_footer_ms_last.clone(),
+        );
         registry.register(L0_FLUSH_WRITE_MS, stats.l0_flush_write_ms.clone());
         registry.register(L0_FLUSH_WRITE_MS_LAST, stats.l0_flush_write_ms_last.clone());
+        registry.register(L0_FLUSH_PUT_MS, stats.l0_flush_put_ms.clone());
+        registry.register(L0_FLUSH_PUT_MS_LAST, stats.l0_flush_put_ms_last.clone());
+        registry.register(L0_FLUSH_CACHE_MS, stats.l0_flush_cache_ms.clone());
+        registry.register(L0_FLUSH_CACHE_MS_LAST, stats.l0_flush_cache_ms_last.clone());
         registry.register(L0_FLUSH_PUBLISH_MS, stats.l0_flush_publish_ms.clone());
         registry.register(
             L0_FLUSH_PUBLISH_MS_LAST,
