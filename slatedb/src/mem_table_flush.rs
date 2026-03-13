@@ -15,6 +15,7 @@ use log::{debug, error, info, warn};
 use std::cmp;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::oneshot::Sender;
 use tracing::instrument;
 
@@ -97,6 +98,7 @@ impl MemtableFlusher {
             let result = self.write_manifest().await;
             if matches!(result, Err(SlateDBError::TransactionalObjectVersionExists)) {
                 debug!("conflicting manifest version. updating and retrying write again.");
+                self.db_inner.db_stats.l0_flush_manifest_retries.inc();
                 self.load_manifest().await?;
             } else {
                 return result;
@@ -120,6 +122,18 @@ impl MemtableFlusher {
                 rguard.state().imm_memtable.back().cloned()
             }
         } {
+            let flush_start = Instant::now();
+            let metadata = imm_memtable.table().metadata();
+            self.db_inner
+                .db_stats
+                .l0_flush_input_rows_last
+                .set(metadata.entry_num as u64);
+            self.db_inner
+                .db_stats
+                .l0_flush_input_bytes_last
+                .set(metadata.entries_size_in_bytes as u64);
+
+            let wal_wait_start = Instant::now();
             if self.db_inner.wal_enabled {
                 let last_seq = imm_memtable.table().last_seq().unwrap_or(0);
                 if self.db_inner.oracle.last_remote_persisted_seq() < last_seq {
@@ -130,6 +144,15 @@ impl MemtableFlusher {
                     );
                 }
             }
+            let wal_wait_elapsed_ms = wal_wait_start.elapsed().as_millis() as u64;
+            self.db_inner
+                .db_stats
+                .l0_flush_wal_wait_ms
+                .add(wal_wait_elapsed_ms);
+            self.db_inner
+                .db_stats
+                .l0_flush_wal_wait_ms_last
+                .set(wal_wait_elapsed_ms);
             let id = SsTableId::Compacted(
                 self.db_inner
                     .rand
@@ -148,6 +171,12 @@ impl MemtableFlusher {
                 .table()
                 .last_seq()
                 .expect("flush of l0 with no entries");
+            let output_bytes = sst_handle.estimate_size();
+            self.db_inner
+                .db_stats
+                .l0_flush_output_bytes_last
+                .set(output_bytes);
+            let publish_start = Instant::now();
             {
                 let min_active_snapshot_seq = self.db_inner.txn_manager.min_active_seq();
 
@@ -198,16 +227,75 @@ impl MemtableFlusher {
                     Ok(())
                 })?;
             }
+            let publish_elapsed_ms = publish_start.elapsed().as_millis() as u64;
+            self.db_inner
+                .db_stats
+                .l0_flush_publish_ms
+                .add(publish_elapsed_ms);
+            self.db_inner
+                .db_stats
+                .l0_flush_publish_ms_last
+                .set(publish_elapsed_ms);
             imm_memtable.notify_flush_to_l0(Ok(()));
             self.db_inner.db_stats.immutable_memtable_flushes.inc();
+            let manifest_start = Instant::now();
             match self.write_manifest_safely().await {
                 Ok(_) => {
+                    let manifest_elapsed_ms = manifest_start.elapsed().as_millis() as u64;
+                    self.db_inner
+                        .db_stats
+                        .l0_flush_manifest_ms
+                        .add(manifest_elapsed_ms);
+                    self.db_inner
+                        .db_stats
+                        .l0_flush_manifest_ms_last
+                        .set(manifest_elapsed_ms);
+                    let total_elapsed_ms = flush_start.elapsed().as_millis() as u64;
+                    self.db_inner
+                        .db_stats
+                        .l0_flush_total_ms
+                        .add(total_elapsed_ms);
+                    self.db_inner
+                        .db_stats
+                        .l0_flush_total_ms_last
+                        .set(total_elapsed_ms);
+                    debug!(
+                        "flushed imm memtable to l0 [rows={}, input_bytes={}, output_bytes={}, wal_wait_ms={}, encode_ms={}, write_ms={}, publish_ms={}, manifest_ms={}, total_ms={}, sst_id={:?}]",
+                        metadata.entry_num,
+                        metadata.entries_size_in_bytes,
+                        output_bytes,
+                        wal_wait_elapsed_ms,
+                        self.db_inner.db_stats.l0_flush_encode_ms_last.value(),
+                        self.db_inner.db_stats.l0_flush_write_ms_last.value(),
+                        publish_elapsed_ms,
+                        manifest_elapsed_ms,
+                        total_elapsed_ms,
+                        id,
+                    );
                     // at this point we know the data in the memtable is durably stored
                     // so notify the relevant listeners
                     imm_memtable.table().notify_durable(Ok(()));
                     self.db_inner.oracle.advance_durable_seq(last_seq);
                 }
                 Err(err) => {
+                    let manifest_elapsed_ms = manifest_start.elapsed().as_millis() as u64;
+                    self.db_inner
+                        .db_stats
+                        .l0_flush_manifest_ms
+                        .add(manifest_elapsed_ms);
+                    self.db_inner
+                        .db_stats
+                        .l0_flush_manifest_ms_last
+                        .set(manifest_elapsed_ms);
+                    let total_elapsed_ms = flush_start.elapsed().as_millis() as u64;
+                    self.db_inner
+                        .db_stats
+                        .l0_flush_total_ms
+                        .add(total_elapsed_ms);
+                    self.db_inner
+                        .db_stats
+                        .l0_flush_total_ms_last
+                        .set(total_elapsed_ms);
                     if matches!(err, SlateDBError::Fenced) {
                         if let Err(delete_err) = self.db_inner.table_store.delete_sst(&id).await {
                             warn!(

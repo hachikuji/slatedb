@@ -9,6 +9,7 @@ use crate::oracle::Oracle;
 use crate::reader::DbStateReader;
 use crate::retention_iterator::RetentionIterator;
 use std::sync::Arc;
+use std::time::Instant;
 
 impl DbInner {
     pub(crate) async fn flush_imm_table(
@@ -19,15 +20,21 @@ impl DbInner {
     ) -> Result<SsTableHandle, SlateDBError> {
         let mut sst_builder = self.table_store.table_builder();
         let mut iter = self.iter_imm_table(imm_table.clone()).await?;
+        let encode_start = Instant::now();
         while let Some(entry) = iter.next().await? {
             sst_builder.add(entry).await?;
         }
-
         let encoded_sst = sst_builder.build().await?;
+        let encode_elapsed = encode_start.elapsed();
+        self.db_inner_stats_update_encode(encode_elapsed.as_millis() as u64);
+
+        let write_start = Instant::now();
         let handle = self
             .table_store
             .write_sst(id, encoded_sst, write_cache)
             .await?;
+        let write_elapsed = write_start.elapsed();
+        self.db_inner_stats_update_write(write_elapsed.as_millis() as u64);
 
         self.mono_clock
             .fetch_max_last_durable_tick(imm_table.last_tick());
@@ -76,6 +83,18 @@ impl DbInner {
         .await?;
         iter.init().await?;
         Ok(iter)
+    }
+}
+
+impl DbInner {
+    fn db_inner_stats_update_encode(&self, elapsed_ms: u64) {
+        self.db_stats.l0_flush_encode_ms.add(elapsed_ms);
+        self.db_stats.l0_flush_encode_ms_last.set(elapsed_ms);
+    }
+
+    fn db_inner_stats_update_write(&self, elapsed_ms: u64) {
+        self.db_stats.l0_flush_write_ms.add(elapsed_ms);
+        self.db_stats.l0_flush_write_ms_last.set(elapsed_ms);
     }
 }
 
