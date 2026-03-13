@@ -40,8 +40,8 @@ pub(crate) struct MemtableFlusher {
     manifest: FenceableManifest,
 }
 
-const MAX_BUILD_IN_FLIGHT: usize = 2;
-const MAX_UPLOAD_IN_FLIGHT: usize = 1;
+const MAX_BUILD_IN_FLIGHT: usize = 1;
+const MAX_UPLOAD_IN_FLIGHT: usize = 2;
 
 struct PendingBuiltFlush {
     flush_seq: u64,
@@ -196,10 +196,6 @@ impl MemtableFlusher {
                     .db_stats
                     .l0_flush_input_rows_last
                     .set(metadata.entry_num as u64);
-                self.db_inner
-                    .db_stats
-                    .l0_flush_input_bytes
-                    .add(metadata.entries_size_in_bytes as u64);
                 self.db_inner
                     .db_stats
                     .l0_flush_input_bytes_last
@@ -531,6 +527,10 @@ impl MemtableFlusher {
             .db_stats
             .l0_flush_output_bytes_last
             .set(ready.output_bytes);
+        self.db_inner
+            .db_stats
+            .l0_flush_input_bytes
+            .add(ready.imm_memtable.table().metadata().entries_size_in_bytes as u64);
         self.db_inner
             .db_stats
             .l0_flush_publish_ms
