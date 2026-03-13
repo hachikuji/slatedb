@@ -69,6 +69,11 @@ pub const L0_FLUSH_INPUT_BYTES: &str = db_stat_name!("l0_flush_input_bytes");
 pub const L0_FLUSH_OUTPUT_BYTES_LAST: &str = db_stat_name!("l0_flush_output_bytes_last");
 pub const L0_FLUSH_OUTPUT_BYTES: &str = db_stat_name!("l0_flush_output_bytes");
 pub const L0_FLUSH_MANIFEST_RETRIES: &str = db_stat_name!("l0_flush_manifest_retries");
+pub const L0_FLUSH_COMMIT_BATCH_SIZE_LAST: &str = db_stat_name!("l0_flush_commit_batch_size_last");
+pub const L0_FLUSH_BUILD_INFLIGHT: &str = db_stat_name!("l0_flush_build_inflight");
+pub const L0_FLUSH_UPLOAD_INFLIGHT: &str = db_stat_name!("l0_flush_upload_inflight");
+pub const L0_FLUSH_BUILT_READY: &str = db_stat_name!("l0_flush_built_ready");
+pub const L0_FLUSH_UPLOADED_READY: &str = db_stat_name!("l0_flush_uploaded_ready");
 
 #[non_exhaustive]
 #[derive(Clone, Debug)]
@@ -135,6 +140,11 @@ pub(crate) struct DbStats {
     pub(crate) l0_flush_output_bytes: Arc<Counter>,
     pub(crate) l0_flush_output_bytes_last: Arc<Gauge<u64>>,
     pub(crate) l0_flush_manifest_retries: Arc<Counter>,
+    pub(crate) l0_flush_commit_batch_size_last: Arc<Gauge<u64>>,
+    pub(crate) l0_flush_build_inflight: Arc<Gauge<i64>>,
+    pub(crate) l0_flush_upload_inflight: Arc<Gauge<i64>>,
+    pub(crate) l0_flush_built_ready: Arc<Gauge<i64>>,
+    pub(crate) l0_flush_uploaded_ready: Arc<Gauge<i64>>,
 }
 
 impl DbStats {
@@ -202,6 +212,11 @@ impl DbStats {
             l0_flush_output_bytes: Arc::new(Counter::default()),
             l0_flush_output_bytes_last: Arc::new(Gauge::default()),
             l0_flush_manifest_retries: Arc::new(Counter::default()),
+            l0_flush_commit_batch_size_last: Arc::new(Gauge::default()),
+            l0_flush_build_inflight: Arc::new(Gauge::default()),
+            l0_flush_upload_inflight: Arc::new(Gauge::default()),
+            l0_flush_built_ready: Arc::new(Gauge::default()),
+            l0_flush_uploaded_ready: Arc::new(Gauge::default()),
         };
         registry.register(
             IMMUTABLE_MEMTABLE_FLUSHES,
@@ -333,6 +348,23 @@ impl DbStats {
         registry.register(
             L0_FLUSH_MANIFEST_RETRIES,
             stats.l0_flush_manifest_retries.clone(),
+        );
+        registry.register(
+            L0_FLUSH_COMMIT_BATCH_SIZE_LAST,
+            stats.l0_flush_commit_batch_size_last.clone(),
+        );
+        registry.register(
+            L0_FLUSH_BUILD_INFLIGHT,
+            stats.l0_flush_build_inflight.clone(),
+        );
+        registry.register(
+            L0_FLUSH_UPLOAD_INFLIGHT,
+            stats.l0_flush_upload_inflight.clone(),
+        );
+        registry.register(L0_FLUSH_BUILT_READY, stats.l0_flush_built_ready.clone());
+        registry.register(
+            L0_FLUSH_UPLOADED_READY,
+            stats.l0_flush_uploaded_ready.clone(),
         );
         stats
     }

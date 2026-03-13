@@ -2,6 +2,7 @@ use crate::db::DbInner;
 use crate::db_state;
 use crate::db_state::SsTableHandle;
 use crate::error::SlateDBError;
+use crate::format::sst::EncodedSsTable;
 use crate::iter::RowEntryIterator;
 use crate::mem_table::KVTable;
 use crate::merge_operator::{MergeOperatorIterator, MergeOperatorRequiredIterator};
@@ -21,6 +22,13 @@ pub(crate) struct FlushImmTableStats {
     pub(crate) cache_ms: u64,
     pub(crate) encode_ms: u64,
     pub(crate) write_ms: u64,
+}
+
+pub(crate) struct BuiltImmTable {
+    pub(crate) encoded_sst: EncodedSsTable,
+    pub(crate) output_bytes: u64,
+    pub(crate) last_tick: i64,
+    pub(crate) stats: FlushImmTableStats,
 }
 
 impl DbInner {
@@ -79,6 +87,62 @@ impl DbInner {
                 write_ms: write_elapsed.as_millis() as u64,
             },
         ))
+    }
+
+    pub(crate) async fn build_imm_table_with_stats(
+        &self,
+        imm_table: Arc<KVTable>,
+    ) -> Result<BuiltImmTable, SlateDBError> {
+        let mut sst_builder = self.table_store.table_builder();
+        let iter_setup_start = Instant::now();
+        let mut iter = self.iter_imm_table(imm_table.clone()).await?;
+        let iter_setup_ms = iter_setup_start.elapsed().as_millis() as u64;
+        let encode_start = Instant::now();
+        let row_loop_start = Instant::now();
+        while let Some(entry) = iter.next().await? {
+            sst_builder.add(entry).await?;
+        }
+        let row_loop_ms = row_loop_start.elapsed().as_millis() as u64;
+        let (encoded_sst, build_stats) = sst_builder.build_with_stats().await?;
+        let output_bytes = encoded_sst.remaining_as_bytes().len() as u64;
+        let encode_elapsed = encode_start.elapsed();
+        self.db_inner_stats_update_encode(encode_elapsed.as_millis() as u64);
+        Ok(BuiltImmTable {
+            encoded_sst,
+            output_bytes,
+            last_tick: imm_table.last_tick(),
+            stats: FlushImmTableStats {
+                iter_setup_ms,
+                row_loop_ms,
+                finish_block_ms: build_stats.finish_block_ms,
+                footer_ms: build_stats.footer_ms,
+                put_ms: 0,
+                cache_ms: 0,
+                encode_ms: encode_elapsed.as_millis() as u64,
+                write_ms: 0,
+            },
+        })
+    }
+
+    pub(crate) async fn upload_built_imm_table_with_stats(
+        &self,
+        id: &db_state::SsTableId,
+        built: BuiltImmTable,
+        write_cache: bool,
+    ) -> Result<(SsTableHandle, FlushImmTableStats, u64), SlateDBError> {
+        let write_start = Instant::now();
+        let (handle, write_stats) = self
+            .table_store
+            .write_sst_with_stats(id, built.encoded_sst, write_cache)
+            .await?;
+        let write_elapsed = write_start.elapsed();
+        self.db_inner_stats_update_write(write_elapsed.as_millis() as u64);
+        self.mono_clock.fetch_max_last_durable_tick(built.last_tick);
+        let mut stats = built.stats;
+        stats.put_ms = write_stats.put_ms;
+        stats.cache_ms = write_stats.cache_ms;
+        stats.write_ms = write_elapsed.as_millis() as u64;
+        Ok((handle, stats, built.output_bytes))
     }
 
     async fn iter_imm_table(

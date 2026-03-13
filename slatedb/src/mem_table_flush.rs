@@ -13,10 +13,12 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use log::{debug, error, info, warn};
 use std::cmp;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::oneshot::Sender;
+use tokio::task::JoinSet;
 use tracing::instrument;
 
 pub(crate) const MEMTABLE_FLUSHER_TASK_NAME: &str = "memtable_writer";
@@ -36,6 +38,30 @@ pub(crate) enum MemtableFlushMsg {
 pub(crate) struct MemtableFlusher {
     db_inner: Arc<DbInner>,
     manifest: FenceableManifest,
+}
+
+const MAX_BUILD_IN_FLIGHT: usize = 2;
+const MAX_UPLOAD_IN_FLIGHT: usize = 1;
+
+struct PendingBuiltFlush {
+    flush_seq: u64,
+    imm_memtable: Arc<crate::mem_table::ImmutableMemtable>,
+    sst_id: SsTableId,
+    flush_start: Instant,
+    wal_wait_elapsed_ms: u64,
+    built: crate::flush::BuiltImmTable,
+}
+
+struct ReadyForCommit {
+    flush_seq: u64,
+    imm_memtable: Arc<crate::mem_table::ImmutableMemtable>,
+    sst_id: SsTableId,
+    sst_handle: crate::db_state::SsTableHandle,
+    output_bytes: u64,
+    flush_stats: crate::flush::FlushImmTableStats,
+    flush_start: Instant,
+    wal_wait_elapsed_ms: u64,
+    last_seq: u64,
 }
 
 impl MemtableFlusher {
@@ -108,148 +134,241 @@ impl MemtableFlusher {
 
     #[instrument(level = "trace", skip_all)]
     async fn flush_imm_memtables_to_l0(&mut self) -> Result<(), SlateDBError> {
-        while let Some(imm_memtable) = {
-            let rguard = self.db_inner.state.read();
-            if rguard.state().core().l0.len() >= self.db_inner.settings.l0_max_ssts {
-                warn!(
-                    "won't flush imm to l0 because too many l0 files [l0_len={}, l0_max_ssts={}]",
-                    rguard.state().core().l0.len(),
-                    self.db_inner.settings.l0_max_ssts
-                );
-                rguard.state().core().log_db_runs();
-                None
-            } else {
-                rguard.state().imm_memtable.back().cloned()
-            }
-        } {
-            let flush_start = Instant::now();
-            let metadata = imm_memtable.table().metadata();
-            self.db_inner
-                .db_stats
-                .l0_flush_input_rows_last
-                .set(metadata.entry_num as u64);
-            self.db_inner
-                .db_stats
-                .l0_flush_input_bytes
-                .add(metadata.entries_size_in_bytes as u64);
-            self.db_inner
-                .db_stats
-                .l0_flush_input_bytes_last
-                .set(metadata.entries_size_in_bytes as u64);
+        let mut next_flush_seq = 0u64;
+        let mut next_commit_seq = 0u64;
+        let mut build_tasks = JoinSet::new();
+        let mut upload_tasks = JoinSet::new();
+        let mut built_ready: BTreeMap<u64, PendingBuiltFlush> = BTreeMap::new();
+        let mut uploaded_ready: BTreeMap<u64, ReadyForCommit> = BTreeMap::new();
 
-            let wal_wait_start = Instant::now();
-            if self.db_inner.wal_enabled {
-                let last_seq = imm_memtable.table().last_seq().unwrap_or(0);
-                if self.db_inner.oracle.last_remote_persisted_seq() < last_seq {
-                    self.db_inner.flush_wals().await?;
-                    assert!(
-                        self.db_inner.oracle.last_remote_persisted_seq() >= last_seq,
-                        "flush_wals did not flush up to the last seq in the imm memtable"
-                    );
+        loop {
+            self.db_inner
+                .db_stats
+                .l0_flush_build_inflight
+                .set(build_tasks.len() as i64);
+            self.db_inner
+                .db_stats
+                .l0_flush_upload_inflight
+                .set(upload_tasks.len() as i64);
+            self.db_inner
+                .db_stats
+                .l0_flush_built_ready
+                .set(built_ready.len() as i64);
+            self.db_inner
+                .db_stats
+                .l0_flush_uploaded_ready
+                .set(uploaded_ready.len() as i64);
+            while build_tasks.len() < MAX_BUILD_IN_FLIGHT {
+                let scheduled_count = build_tasks.len()
+                    + upload_tasks.len()
+                    + built_ready.len()
+                    + uploaded_ready.len();
+                let maybe_imm_memtable = {
+                    let rguard = self.db_inner.state.read();
+                    if rguard.state().core().l0.len() + scheduled_count
+                        >= self.db_inner.settings.l0_max_ssts
+                    {
+                        warn!(
+                            "won't flush imm to l0 because too many l0 files [l0_len={}, in_flight={}, l0_max_ssts={}]",
+                            rguard.state().core().l0.len(),
+                            scheduled_count,
+                            self.db_inner.settings.l0_max_ssts
+                        );
+                        rguard.state().core().log_db_runs();
+                        None
+                    } else {
+                        rguard
+                            .state()
+                            .imm_memtable
+                            .iter()
+                            .rev()
+                            .nth(scheduled_count)
+                            .cloned()
+                    }
+                };
+                let Some(imm_memtable) = maybe_imm_memtable else {
+                    break;
+                };
+
+                let flush_start = Instant::now();
+                let metadata = imm_memtable.table().metadata();
+                self.db_inner
+                    .db_stats
+                    .l0_flush_input_rows_last
+                    .set(metadata.entry_num as u64);
+                self.db_inner
+                    .db_stats
+                    .l0_flush_input_bytes
+                    .add(metadata.entries_size_in_bytes as u64);
+                self.db_inner
+                    .db_stats
+                    .l0_flush_input_bytes_last
+                    .set(metadata.entries_size_in_bytes as u64);
+
+                let wal_wait_start = Instant::now();
+                if self.db_inner.wal_enabled {
+                    let last_seq = imm_memtable.table().last_seq().unwrap_or(0);
+                    if self.db_inner.oracle.last_remote_persisted_seq() < last_seq {
+                        self.db_inner.flush_wals().await?;
+                        assert!(
+                            self.db_inner.oracle.last_remote_persisted_seq() >= last_seq,
+                            "flush_wals did not flush up to the last seq in the imm memtable"
+                        );
+                    }
+                }
+                let wal_wait_elapsed_ms = wal_wait_start.elapsed().as_millis() as u64;
+                self.db_inner
+                    .db_stats
+                    .l0_flush_wal_wait_ms
+                    .add(wal_wait_elapsed_ms);
+                self.db_inner
+                    .db_stats
+                    .l0_flush_wal_wait_ms_last
+                    .set(wal_wait_elapsed_ms);
+
+                let sst_id = SsTableId::Compacted(
+                    self.db_inner
+                        .rand
+                        .rng()
+                        .gen_ulid(self.db_inner.system_clock.as_ref()),
+                );
+                let flush_seq = next_flush_seq;
+                next_flush_seq += 1;
+                let db_inner = Arc::clone(&self.db_inner);
+                let imm_for_task = Arc::clone(&imm_memtable);
+                build_tasks.spawn(async move {
+                    let built = db_inner
+                        .build_imm_table_with_stats(imm_for_task.table())
+                        .await?;
+                    Ok::<_, SlateDBError>(PendingBuiltFlush {
+                        flush_seq,
+                        imm_memtable,
+                        sst_id,
+                        flush_start,
+                        wal_wait_elapsed_ms,
+                        built,
+                    })
+                });
+            }
+
+            if upload_tasks.len() < MAX_UPLOAD_IN_FLIGHT {
+                if let Some((&flush_seq, _pending)) = built_ready.iter().next() {
+                    let pending = built_ready
+                        .remove(&flush_seq)
+                        .expect("pending build exists");
+                    let db_inner = Arc::clone(&self.db_inner);
+                    upload_tasks.spawn(async move {
+                        let last_seq = pending
+                            .imm_memtable
+                            .table()
+                            .last_seq()
+                            .expect("flush of l0 with no entries");
+                        let (sst_handle, flush_stats, output_bytes) = db_inner
+                            .upload_built_imm_table_with_stats(&pending.sst_id, pending.built, true)
+                            .await?;
+                        Ok::<_, SlateDBError>(ReadyForCommit {
+                            flush_seq: pending.flush_seq,
+                            imm_memtable: pending.imm_memtable,
+                            sst_id: pending.sst_id,
+                            sst_handle,
+                            output_bytes,
+                            flush_stats,
+                            flush_start: pending.flush_start,
+                            wal_wait_elapsed_ms: pending.wal_wait_elapsed_ms,
+                            last_seq,
+                        })
+                    });
                 }
             }
-            let wal_wait_elapsed_ms = wal_wait_start.elapsed().as_millis() as u64;
-            self.db_inner
-                .db_stats
-                .l0_flush_wal_wait_ms
-                .add(wal_wait_elapsed_ms);
-            self.db_inner
-                .db_stats
-                .l0_flush_wal_wait_ms_last
-                .set(wal_wait_elapsed_ms);
-            let id = SsTableId::Compacted(
-                self.db_inner
-                    .rand
-                    .rng()
-                    .gen_ulid(self.db_inner.system_clock.as_ref()),
-            );
-            let (sst_handle, flush_stats) = self
-                .db_inner
-                .flush_imm_table_with_stats(&id, imm_memtable.table(), true)
-                .await?;
-            self.db_inner
-                .db_stats
-                .l0_flush_iter_setup_ms
-                .add(flush_stats.iter_setup_ms);
-            self.db_inner
-                .db_stats
-                .l0_flush_iter_setup_ms_last
-                .set(flush_stats.iter_setup_ms);
-            self.db_inner
-                .db_stats
-                .l0_flush_row_loop_ms
-                .add(flush_stats.row_loop_ms);
-            self.db_inner
-                .db_stats
-                .l0_flush_row_loop_ms_last
-                .set(flush_stats.row_loop_ms);
-            self.db_inner
-                .db_stats
-                .l0_flush_finish_block_ms
-                .add(flush_stats.finish_block_ms);
-            self.db_inner
-                .db_stats
-                .l0_flush_finish_block_ms_last
-                .set(flush_stats.finish_block_ms);
-            self.db_inner
-                .db_stats
-                .l0_flush_footer_ms
-                .add(flush_stats.footer_ms);
-            self.db_inner
-                .db_stats
-                .l0_flush_footer_ms_last
-                .set(flush_stats.footer_ms);
-            self.db_inner
-                .db_stats
-                .l0_flush_put_ms
-                .add(flush_stats.put_ms);
-            self.db_inner
-                .db_stats
-                .l0_flush_put_ms_last
-                .set(flush_stats.put_ms);
-            self.db_inner
-                .db_stats
-                .l0_flush_cache_ms
-                .add(flush_stats.cache_ms);
-            self.db_inner
-                .db_stats
-                .l0_flush_cache_ms_last
-                .set(flush_stats.cache_ms);
-            fail_point!(
-                Arc::clone(&self.db_inner.fp_registry),
-                "after-flush-imm-to-l0-before-manifest"
-            );
-            let last_seq = imm_memtable
-                .table()
-                .last_seq()
-                .expect("flush of l0 with no entries");
-            let output_bytes = sst_handle.estimate_size();
-            self.db_inner
-                .db_stats
-                .l0_flush_output_bytes
-                .add(output_bytes);
-            self.db_inner
-                .db_stats
-                .l0_flush_output_bytes_last
-                .set(output_bytes);
-            let publish_start = Instant::now();
-            {
-                let min_active_snapshot_seq = self.db_inner.txn_manager.min_active_seq();
 
-                let mut guard = self.db_inner.state.write();
-                guard.modify(|modifier| {
+            let mut batch = Vec::new();
+            while let Some(ready) = uploaded_ready.remove(&next_commit_seq) {
+                batch.push(ready);
+                next_commit_seq += 1;
+            }
+            if !batch.is_empty() {
+                self.commit_uploaded_flushes(batch).await?;
+                continue;
+            }
+
+            let no_more_schedulable = {
+                let scheduled_count = build_tasks.len()
+                    + upload_tasks.len()
+                    + built_ready.len()
+                    + uploaded_ready.len();
+                let rguard = self.db_inner.state.read();
+                rguard
+                    .state()
+                    .imm_memtable
+                    .iter()
+                    .rev()
+                    .nth(scheduled_count)
+                    .is_none()
+            };
+            if no_more_schedulable
+                && build_tasks.is_empty()
+                && upload_tasks.is_empty()
+                && built_ready.is_empty()
+                && uploaded_ready.is_empty()
+            {
+                break;
+            }
+
+            if build_tasks.is_empty()
+                && upload_tasks.is_empty()
+                && built_ready.is_empty()
+                && uploaded_ready.is_empty()
+            {
+                break;
+            }
+
+            tokio::select! {
+                Some(result) = build_tasks.join_next(), if !build_tasks.is_empty() => {
+                    let pending = result.expect("build task panicked")?;
+                    built_ready.insert(pending.flush_seq, pending);
+                }
+                Some(result) = upload_tasks.join_next(), if !upload_tasks.is_empty() => {
+                    let uploaded = result.expect("upload task panicked")?;
+                    uploaded_ready.insert(uploaded.flush_seq, uploaded);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn commit_uploaded_flushes(
+        &mut self,
+        batch: Vec<ReadyForCommit>,
+    ) -> Result<(), SlateDBError> {
+        let publish_start = Instant::now();
+        let publish_share_count = batch.len() as u64;
+        self.db_inner
+            .db_stats
+            .l0_flush_commit_batch_size_last
+            .set(publish_share_count);
+        let min_active_snapshot_seq = self.db_inner.txn_manager.min_active_seq();
+        {
+            let mut guard = self.db_inner.state.write();
+            guard.modify(|modifier| {
+                for ready in &batch {
                     let popped = modifier
                         .state
                         .imm_memtable
                         .pop_back()
                         .expect("expected imm memtable");
-                    assert!(Arc::ptr_eq(&popped, &imm_memtable));
-                    modifier.state.manifest.value.core.l0.push_front(sst_handle);
+                    assert!(Arc::ptr_eq(&popped, &ready.imm_memtable));
+                    modifier
+                        .state
+                        .manifest
+                        .value
+                        .core
+                        .l0
+                        .push_front(ready.sst_handle.clone());
                     modifier.state.manifest.value.core.replay_after_wal_id =
-                        imm_memtable.recent_flushed_wal_id();
+                        ready.imm_memtable.recent_flushed_wal_id();
 
-                    // ensure the persisted manifest tick never goes backwards in time
-                    let memtable_tick = imm_memtable.table().last_tick();
+                    let memtable_tick = ready.imm_memtable.table().last_tick();
                     modifier.state.manifest.value.core.last_l0_clock_tick = cmp::max(
                         modifier.state.manifest.value.core.last_l0_clock_tick,
                         memtable_tick,
@@ -261,52 +380,45 @@ impl MemtableFlusher {
                         });
                     }
 
-                    // update the persisted manifest last_l0_seq as the latest seq in the imm.
-                    assert!(last_seq >= modifier.state.manifest.value.core.last_l0_seq);
-                    modifier.state.manifest.value.core.last_l0_seq = last_seq;
-
-                    // update the persisted manifest recent_snapshot_min_seq to inform the compactor
-                    // can safely reclaim the entries with smaller seq. if there's no active snapshot,
-                    // we simply use the latest l0 seq.
+                    assert!(ready.last_seq >= modifier.state.manifest.value.core.last_l0_seq);
+                    modifier.state.manifest.value.core.last_l0_seq = ready.last_seq;
                     modifier.state.manifest.value.core.recent_snapshot_min_seq =
-                        min_active_snapshot_seq.unwrap_or(last_seq);
-
-                    let sequence_tracker = imm_memtable.sequence_tracker();
+                        min_active_snapshot_seq.unwrap_or(ready.last_seq);
                     modifier
                         .state
                         .manifest
                         .value
                         .core
                         .sequence_tracker
-                        .extend_from(sequence_tracker);
+                        .extend_from(ready.imm_memtable.sequence_tracker());
+                }
 
-                    Ok(())
-                })?;
-            }
-            let publish_elapsed_ms = publish_start.elapsed().as_millis() as u64;
-            self.db_inner
-                .db_stats
-                .l0_flush_publish_ms
-                .add(publish_elapsed_ms);
-            self.db_inner
-                .db_stats
-                .l0_flush_publish_ms_last
-                .set(publish_elapsed_ms);
-            imm_memtable.notify_flush_to_l0(Ok(()));
+                Ok(())
+            })?;
+        }
+        let publish_elapsed_ms = publish_start.elapsed().as_millis() as u64;
+        let publish_share_ms = publish_elapsed_ms / publish_share_count.max(1);
+        for ready in &batch {
+            self.record_uploaded_flush_metrics(ready, publish_share_ms);
+            ready.imm_memtable.notify_flush_to_l0(Ok(()));
             self.db_inner.db_stats.immutable_memtable_flushes.inc();
-            let manifest_start = Instant::now();
-            match self.write_manifest_safely().await {
-                Ok(_) => {
-                    let manifest_elapsed_ms = manifest_start.elapsed().as_millis() as u64;
+        }
+
+        let manifest_start = Instant::now();
+        match self.write_manifest_safely().await {
+            Ok(_) => {
+                let manifest_elapsed_ms = manifest_start.elapsed().as_millis() as u64;
+                let manifest_share_ms = manifest_elapsed_ms / publish_share_count.max(1);
+                for ready in &batch {
                     self.db_inner
                         .db_stats
                         .l0_flush_manifest_ms
-                        .add(manifest_elapsed_ms);
+                        .add(manifest_share_ms);
                     self.db_inner
                         .db_stats
                         .l0_flush_manifest_ms_last
-                        .set(manifest_elapsed_ms);
-                    let total_elapsed_ms = flush_start.elapsed().as_millis() as u64;
+                        .set(manifest_share_ms);
+                    let total_elapsed_ms = ready.flush_start.elapsed().as_millis() as u64;
                     self.db_inner
                         .db_stats
                         .l0_flush_total_ms
@@ -316,64 +428,117 @@ impl MemtableFlusher {
                         .l0_flush_total_ms_last
                         .set(total_elapsed_ms);
                     debug!(
-                        "flushed imm memtable to l0 [rows={}, input_bytes={}, output_bytes={}, wal_wait_ms={}, iter_setup_ms={}, row_loop_ms={}, finish_block_ms={}, footer_ms={}, encode_ms={}, put_ms={}, cache_ms={}, write_ms={}, publish_ms={}, manifest_ms={}, total_ms={}, sst_id={:?}]",
-                        metadata.entry_num,
-                        metadata.entries_size_in_bytes,
-                        output_bytes,
-                        wal_wait_elapsed_ms,
-                        flush_stats.iter_setup_ms,
-                        flush_stats.row_loop_ms,
-                        flush_stats.finish_block_ms,
-                        flush_stats.footer_ms,
-                        flush_stats.encode_ms,
-                        flush_stats.put_ms,
-                        flush_stats.cache_ms,
-                        flush_stats.write_ms,
-                        publish_elapsed_ms,
-                        manifest_elapsed_ms,
+                        "flushed imm memtable to l0 [flush_seq={}, input_bytes={}, output_bytes={}, wal_wait_ms={}, iter_setup_ms={}, row_loop_ms={}, finish_block_ms={}, footer_ms={}, encode_ms={}, put_ms={}, cache_ms={}, write_ms={}, publish_ms={}, manifest_ms={}, total_ms={}, sst_id={:?}]",
+                        ready.flush_seq,
+                        ready.imm_memtable.table().metadata().entries_size_in_bytes,
+                        ready.output_bytes,
+                        ready.wal_wait_elapsed_ms,
+                        ready.flush_stats.iter_setup_ms,
+                        ready.flush_stats.row_loop_ms,
+                        ready.flush_stats.finish_block_ms,
+                        ready.flush_stats.footer_ms,
+                        ready.flush_stats.encode_ms,
+                        ready.flush_stats.put_ms,
+                        ready.flush_stats.cache_ms,
+                        ready.flush_stats.write_ms,
+                        publish_share_ms,
+                        manifest_share_ms,
                         total_elapsed_ms,
-                        id,
+                        ready.sst_id,
                     );
-                    // at this point we know the data in the memtable is durably stored
-                    // so notify the relevant listeners
-                    imm_memtable.table().notify_durable(Ok(()));
-                    self.db_inner.oracle.advance_durable_seq(last_seq);
-                }
-                Err(err) => {
-                    let manifest_elapsed_ms = manifest_start.elapsed().as_millis() as u64;
-                    self.db_inner
-                        .db_stats
-                        .l0_flush_manifest_ms
-                        .add(manifest_elapsed_ms);
-                    self.db_inner
-                        .db_stats
-                        .l0_flush_manifest_ms_last
-                        .set(manifest_elapsed_ms);
-                    let total_elapsed_ms = flush_start.elapsed().as_millis() as u64;
-                    self.db_inner
-                        .db_stats
-                        .l0_flush_total_ms
-                        .add(total_elapsed_ms);
-                    self.db_inner
-                        .db_stats
-                        .l0_flush_total_ms_last
-                        .set(total_elapsed_ms);
-                    if matches!(err, SlateDBError::Fenced) {
-                        if let Err(delete_err) = self.db_inner.table_store.delete_sst(&id).await {
-                            warn!(
-                                "failed to delete fenced SST [id={:?}, error={:?}]",
-                                id, delete_err
-                            );
-                        }
-                        // refresh manifest and state so that local state reflects remote
-                        self.load_manifest().await?;
-                    }
-                    imm_memtable.table().notify_durable(Err(err.clone()));
-                    return Err(err);
+                    ready.imm_memtable.table().notify_durable(Ok(()));
+                    self.db_inner.oracle.advance_durable_seq(ready.last_seq);
                 }
             }
+            Err(err) => {
+                for ready in &batch {
+                    if matches!(err, SlateDBError::Fenced) {
+                        if let Err(delete_err) =
+                            self.db_inner.table_store.delete_sst(&ready.sst_id).await
+                        {
+                            warn!(
+                                "failed to delete fenced SST [id={:?}, error={:?}]",
+                                ready.sst_id, delete_err
+                            );
+                        }
+                    }
+                    ready.imm_memtable.table().notify_durable(Err(err.clone()));
+                }
+                if matches!(err, SlateDBError::Fenced) {
+                    self.load_manifest().await?;
+                }
+                return Err(err);
+            }
         }
+
         Ok(())
+    }
+
+    fn record_uploaded_flush_metrics(&self, ready: &ReadyForCommit, publish_elapsed_ms: u64) {
+        self.db_inner
+            .db_stats
+            .l0_flush_iter_setup_ms
+            .add(ready.flush_stats.iter_setup_ms);
+        self.db_inner
+            .db_stats
+            .l0_flush_iter_setup_ms_last
+            .set(ready.flush_stats.iter_setup_ms);
+        self.db_inner
+            .db_stats
+            .l0_flush_row_loop_ms
+            .add(ready.flush_stats.row_loop_ms);
+        self.db_inner
+            .db_stats
+            .l0_flush_row_loop_ms_last
+            .set(ready.flush_stats.row_loop_ms);
+        self.db_inner
+            .db_stats
+            .l0_flush_finish_block_ms
+            .add(ready.flush_stats.finish_block_ms);
+        self.db_inner
+            .db_stats
+            .l0_flush_finish_block_ms_last
+            .set(ready.flush_stats.finish_block_ms);
+        self.db_inner
+            .db_stats
+            .l0_flush_footer_ms
+            .add(ready.flush_stats.footer_ms);
+        self.db_inner
+            .db_stats
+            .l0_flush_footer_ms_last
+            .set(ready.flush_stats.footer_ms);
+        self.db_inner
+            .db_stats
+            .l0_flush_put_ms
+            .add(ready.flush_stats.put_ms);
+        self.db_inner
+            .db_stats
+            .l0_flush_put_ms_last
+            .set(ready.flush_stats.put_ms);
+        self.db_inner
+            .db_stats
+            .l0_flush_cache_ms
+            .add(ready.flush_stats.cache_ms);
+        self.db_inner
+            .db_stats
+            .l0_flush_cache_ms_last
+            .set(ready.flush_stats.cache_ms);
+        self.db_inner
+            .db_stats
+            .l0_flush_output_bytes
+            .add(ready.output_bytes);
+        self.db_inner
+            .db_stats
+            .l0_flush_output_bytes_last
+            .set(ready.output_bytes);
+        self.db_inner
+            .db_stats
+            .l0_flush_publish_ms
+            .add(publish_elapsed_ms);
+        self.db_inner
+            .db_stats
+            .l0_flush_publish_ms_last
+            .set(publish_elapsed_ms);
     }
 
     async fn flush_and_record(&mut self) -> Result<(), SlateDBError> {
