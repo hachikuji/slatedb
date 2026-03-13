@@ -21,6 +21,9 @@ pub const WRITE_BATCH_COUNT: &str = db_stat_name!("write_batch_count");
 pub const WRITE_OPS: &str = db_stat_name!("write_ops");
 pub const TOTAL_MEM_SIZE_BYTES: &str = db_stat_name!("total_mem_size_bytes");
 pub const L0_SST_COUNT: &str = db_stat_name!("l0_sst_count");
+pub const ACTIVE_MEMTABLE_BYTES: &str = db_stat_name!("active_memtable_bytes");
+pub const IMM_MEMTABLE_COUNT: &str = db_stat_name!("imm_memtable_count");
+pub const IMM_MEMTABLE_BYTES: &str = db_stat_name!("imm_memtable_bytes");
 pub const L0_FLUSH_TOTAL_MS: &str = db_stat_name!("l0_flush_total_ms");
 pub const L0_FLUSH_TOTAL_MS_LAST: &str = db_stat_name!("l0_flush_total_ms_last");
 pub const L0_FLUSH_WAL_WAIT_MS: &str = db_stat_name!("l0_flush_wal_wait_ms");
@@ -35,7 +38,9 @@ pub const L0_FLUSH_MANIFEST_MS: &str = db_stat_name!("l0_flush_manifest_ms");
 pub const L0_FLUSH_MANIFEST_MS_LAST: &str = db_stat_name!("l0_flush_manifest_ms_last");
 pub const L0_FLUSH_INPUT_ROWS_LAST: &str = db_stat_name!("l0_flush_input_rows_last");
 pub const L0_FLUSH_INPUT_BYTES_LAST: &str = db_stat_name!("l0_flush_input_bytes_last");
+pub const L0_FLUSH_INPUT_BYTES: &str = db_stat_name!("l0_flush_input_bytes");
 pub const L0_FLUSH_OUTPUT_BYTES_LAST: &str = db_stat_name!("l0_flush_output_bytes_last");
+pub const L0_FLUSH_OUTPUT_BYTES: &str = db_stat_name!("l0_flush_output_bytes");
 pub const L0_FLUSH_MANIFEST_RETRIES: &str = db_stat_name!("l0_flush_manifest_retries");
 
 #[non_exhaustive]
@@ -55,6 +60,9 @@ pub(crate) struct DbStats {
     pub(crate) write_ops: Arc<Counter>,
     pub(crate) total_mem_size_bytes: Arc<Gauge<i64>>,
     pub(crate) l0_sst_count: Arc<Gauge<i64>>,
+    pub(crate) active_memtable_bytes: Arc<Gauge<i64>>,
+    pub(crate) imm_memtable_count: Arc<Gauge<i64>>,
+    pub(crate) imm_memtable_bytes: Arc<Gauge<i64>>,
     pub(crate) l0_flush_total_ms: Arc<Counter>,
     pub(crate) l0_flush_total_ms_last: Arc<Gauge<u64>>,
     pub(crate) l0_flush_wal_wait_ms: Arc<Counter>,
@@ -68,7 +76,9 @@ pub(crate) struct DbStats {
     pub(crate) l0_flush_manifest_ms: Arc<Counter>,
     pub(crate) l0_flush_manifest_ms_last: Arc<Gauge<u64>>,
     pub(crate) l0_flush_input_rows_last: Arc<Gauge<u64>>,
+    pub(crate) l0_flush_input_bytes: Arc<Counter>,
     pub(crate) l0_flush_input_bytes_last: Arc<Gauge<u64>>,
+    pub(crate) l0_flush_output_bytes: Arc<Counter>,
     pub(crate) l0_flush_output_bytes_last: Arc<Gauge<u64>>,
     pub(crate) l0_flush_manifest_retries: Arc<Counter>,
 }
@@ -90,6 +100,9 @@ impl DbStats {
             write_ops: Arc::new(Counter::default()),
             total_mem_size_bytes: Arc::new(Gauge::default()),
             l0_sst_count: Arc::new(Gauge::default()),
+            active_memtable_bytes: Arc::new(Gauge::default()),
+            imm_memtable_count: Arc::new(Gauge::default()),
+            imm_memtable_bytes: Arc::new(Gauge::default()),
             l0_flush_total_ms: Arc::new(Counter::default()),
             l0_flush_total_ms_last: Arc::new(Gauge::default()),
             l0_flush_wal_wait_ms: Arc::new(Counter::default()),
@@ -103,7 +116,9 @@ impl DbStats {
             l0_flush_manifest_ms: Arc::new(Counter::default()),
             l0_flush_manifest_ms_last: Arc::new(Gauge::default()),
             l0_flush_input_rows_last: Arc::new(Gauge::default()),
+            l0_flush_input_bytes: Arc::new(Counter::default()),
             l0_flush_input_bytes_last: Arc::new(Gauge::default()),
+            l0_flush_output_bytes: Arc::new(Counter::default()),
             l0_flush_output_bytes_last: Arc::new(Gauge::default()),
             l0_flush_manifest_retries: Arc::new(Counter::default()),
         };
@@ -130,6 +145,9 @@ impl DbStats {
         registry.register(WRITE_OPS, stats.write_ops.clone());
         registry.register(TOTAL_MEM_SIZE_BYTES, stats.total_mem_size_bytes.clone());
         registry.register(L0_SST_COUNT, stats.l0_sst_count.clone());
+        registry.register(ACTIVE_MEMTABLE_BYTES, stats.active_memtable_bytes.clone());
+        registry.register(IMM_MEMTABLE_COUNT, stats.imm_memtable_count.clone());
+        registry.register(IMM_MEMTABLE_BYTES, stats.imm_memtable_bytes.clone());
         registry.register(L0_FLUSH_TOTAL_MS, stats.l0_flush_total_ms.clone());
         registry.register(L0_FLUSH_TOTAL_MS_LAST, stats.l0_flush_total_ms_last.clone());
         registry.register(L0_FLUSH_WAL_WAIT_MS, stats.l0_flush_wal_wait_ms.clone());
@@ -158,10 +176,12 @@ impl DbStats {
             L0_FLUSH_INPUT_ROWS_LAST,
             stats.l0_flush_input_rows_last.clone(),
         );
+        registry.register(L0_FLUSH_INPUT_BYTES, stats.l0_flush_input_bytes.clone());
         registry.register(
             L0_FLUSH_INPUT_BYTES_LAST,
             stats.l0_flush_input_bytes_last.clone(),
         );
+        registry.register(L0_FLUSH_OUTPUT_BYTES, stats.l0_flush_output_bytes.clone());
         registry.register(
             L0_FLUSH_OUTPUT_BYTES_LAST,
             stats.l0_flush_output_bytes_last.clone(),

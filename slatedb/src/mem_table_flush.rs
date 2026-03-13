@@ -130,6 +130,10 @@ impl MemtableFlusher {
                 .set(metadata.entry_num as u64);
             self.db_inner
                 .db_stats
+                .l0_flush_input_bytes
+                .add(metadata.entries_size_in_bytes as u64);
+            self.db_inner
+                .db_stats
                 .l0_flush_input_bytes_last
                 .set(metadata.entries_size_in_bytes as u64);
 
@@ -172,6 +176,10 @@ impl MemtableFlusher {
                 .last_seq()
                 .expect("flush of l0 with no entries");
             let output_bytes = sst_handle.estimate_size();
+            self.db_inner
+                .db_stats
+                .l0_flush_output_bytes
+                .add(output_bytes);
             self.db_inner
                 .db_stats
                 .l0_flush_output_bytes_last

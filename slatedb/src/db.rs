@@ -297,12 +297,25 @@ impl DbInner {
     #[inline]
     pub(crate) async fn maybe_apply_backpressure(&self) -> Result<(), SlateDBError> {
         loop {
-            let (wal_size_bytes, imm_memtable_size_bytes) = {
+            let (
+                wal_size_bytes,
+                active_memtable_size_bytes,
+                imm_memtable_count,
+                imm_memtable_size_bytes,
+            ) = {
                 let wal_size_bytes = self.wal_buffer.estimated_bytes()?;
-                let imm_memtable_size_bytes = {
+                let (active_memtable_size_bytes, imm_memtable_count, imm_memtable_size_bytes) = {
                     let guard = self.state.read();
+                    let active_memtable_size_bytes = {
+                        let metadata = guard.memtable().metadata();
+                        self.table_store.estimate_encoded_size_compacted(
+                            metadata.entry_num,
+                            metadata.entries_size_in_bytes,
+                        )
+                    };
                     // Exclude active memtable to avoid a write lock.
-                    guard
+                    let imm_memtable_count = guard.state().imm_memtable.len();
+                    let imm_memtable_size_bytes = guard
                         .state()
                         .imm_memtable
                         .iter()
@@ -313,19 +326,40 @@ impl DbInner {
                                 metadata.entries_size_in_bytes,
                             )
                         })
-                        .sum::<usize>()
+                        .sum::<usize>();
+                    (
+                        active_memtable_size_bytes,
+                        imm_memtable_count,
+                        imm_memtable_size_bytes,
+                    )
                 };
-                (wal_size_bytes, imm_memtable_size_bytes)
+                (
+                    wal_size_bytes,
+                    active_memtable_size_bytes,
+                    imm_memtable_count,
+                    imm_memtable_size_bytes,
+                )
             };
             let total_mem_size_bytes = wal_size_bytes + imm_memtable_size_bytes;
             self.db_stats
                 .total_mem_size_bytes
                 .set(total_mem_size_bytes as i64);
+            self.db_stats
+                .active_memtable_bytes
+                .set(active_memtable_size_bytes as i64);
+            self.db_stats
+                .imm_memtable_count
+                .set(imm_memtable_count as i64);
+            self.db_stats
+                .imm_memtable_bytes
+                .set(imm_memtable_size_bytes as i64);
 
             trace!(
-                "checking backpressure [total_mem_size_bytes={}, wal_size_bytes={}, imm_memtable_size_bytes={}, max_unflushed_bytes={}]",
+                "checking backpressure [total_mem_size_bytes={}, wal_size_bytes={}, active_memtable_size_bytes={}, imm_memtable_count={}, imm_memtable_size_bytes={}, max_unflushed_bytes={}]",
                 format_bytes_si(total_mem_size_bytes as u64),
                 format_bytes_si(wal_size_bytes as u64),
+                format_bytes_si(active_memtable_size_bytes as u64),
+                imm_memtable_count,
                 format_bytes_si(imm_memtable_size_bytes as u64),
                 format_bytes_si(self.settings.max_unflushed_bytes as u64),
             );
@@ -333,9 +367,11 @@ impl DbInner {
             if total_mem_size_bytes >= self.settings.max_unflushed_bytes {
                 self.db_stats.backpressure_count.inc();
                 warn!(
-                    "unflushed memtable size exceeds max_unflushed_bytes. applying backpressure. [total_mem_size_bytes={}, wal_size_bytes={}, imm_memtable_size_bytes={}, max_unflushed_bytes={}]",
+                    "unflushed memtable size exceeds max_unflushed_bytes. applying backpressure. [total_mem_size_bytes={}, wal_size_bytes={}, active_memtable_size_bytes={}, imm_memtable_count={}, imm_memtable_size_bytes={}, max_unflushed_bytes={}]",
                     format_bytes_si(total_mem_size_bytes as u64),
                     format_bytes_si(wal_size_bytes as u64),
+                    format_bytes_si(active_memtable_size_bytes as u64),
+                    imm_memtable_count,
                     format_bytes_si(imm_memtable_size_bytes as u64),
                     format_bytes_si(self.settings.max_unflushed_bytes as u64),
                 );
