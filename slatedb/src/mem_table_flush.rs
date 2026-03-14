@@ -48,7 +48,6 @@ struct PendingBuiltFlush {
     imm_memtable: Arc<crate::mem_table::ImmutableMemtable>,
     sst_id: SsTableId,
     flush_start: Instant,
-    wal_wait_elapsed_ms: u64,
     built_at: Instant,
     built: crate::flush::BuiltImmTable,
 }
@@ -61,7 +60,6 @@ struct ReadyForCommit {
     output_bytes: u64,
     flush_stats: crate::flush::FlushImmTableStats,
     flush_start: Instant,
-    wal_wait_elapsed_ms: u64,
     built_at: Instant,
     upload_started_at: Instant,
     uploaded_at: Instant,
@@ -205,27 +203,6 @@ impl MemtableFlusher {
                     .l0_flush_input_bytes_last
                     .set(metadata.entries_size_in_bytes as u64);
 
-                let wal_wait_start = Instant::now();
-                if self.db_inner.wal_enabled {
-                    let last_seq = imm_memtable.table().last_seq().unwrap_or(0);
-                    if self.db_inner.oracle.last_remote_persisted_seq() < last_seq {
-                        self.db_inner.flush_wals().await?;
-                        assert!(
-                            self.db_inner.oracle.last_remote_persisted_seq() >= last_seq,
-                            "flush_wals did not flush up to the last seq in the imm memtable"
-                        );
-                    }
-                }
-                let wal_wait_elapsed_ms = wal_wait_start.elapsed().as_millis() as u64;
-                self.db_inner
-                    .db_stats
-                    .l0_flush_wal_wait_ms
-                    .add(wal_wait_elapsed_ms);
-                self.db_inner
-                    .db_stats
-                    .l0_flush_wal_wait_ms_last
-                    .set(wal_wait_elapsed_ms);
-
                 let sst_id = SsTableId::Compacted(
                     self.db_inner
                         .rand
@@ -245,7 +222,6 @@ impl MemtableFlusher {
                         imm_memtable,
                         sst_id,
                         flush_start,
-                        wal_wait_elapsed_ms,
                         built_at: Instant::now(),
                         built,
                     })
@@ -276,7 +252,6 @@ impl MemtableFlusher {
                             output_bytes,
                             flush_stats,
                             flush_start: pending.flush_start,
-                            wal_wait_elapsed_ms: pending.wal_wait_elapsed_ms,
                             built_at: pending.built_at,
                             upload_started_at,
                             uploaded_at: Instant::now(),
@@ -409,6 +384,30 @@ impl MemtableFlusher {
             self.db_inner.db_stats.immutable_memtable_flushes.inc();
         }
 
+        // Flush WALs before manifest update. The WAL is watermark-based, so
+        // flushing up to the max seq in the batch covers all earlier entries.
+        let wal_wait_start = Instant::now();
+        if self.db_inner.wal_enabled {
+            let max_seq = batch.iter().map(|r| r.last_seq).max().unwrap();
+            if self.db_inner.oracle.last_remote_persisted_seq() < max_seq {
+                self.db_inner.flush_wals().await?;
+                assert!(
+                    self.db_inner.oracle.last_remote_persisted_seq() >= max_seq,
+                    "flush_wals did not flush up to the last seq in the batch"
+                );
+            }
+        }
+        let wal_wait_elapsed_ms = wal_wait_start.elapsed().as_millis() as u64;
+        let wal_wait_share_ms = wal_wait_elapsed_ms / publish_share_count.max(1);
+        self.db_inner
+            .db_stats
+            .l0_flush_wal_wait_ms
+            .add(wal_wait_elapsed_ms);
+        self.db_inner
+            .db_stats
+            .l0_flush_wal_wait_ms_last
+            .set(wal_wait_share_ms);
+
         let manifest_start = Instant::now();
         match self.write_manifest_safely().await {
             Ok(_) => {
@@ -437,7 +436,7 @@ impl MemtableFlusher {
                         ready.flush_seq,
                         ready.imm_memtable.table().metadata().entries_size_in_bytes,
                         ready.output_bytes,
-                        ready.wal_wait_elapsed_ms,
+                        wal_wait_share_ms,
                         ready.flush_stats.iter_setup_ms,
                         ready.flush_stats.row_loop_ms,
                         ready.flush_stats.finish_block_ms,
