@@ -5610,6 +5610,172 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "wal_disable")]
+    async fn should_not_lose_frozen_memtable_when_wal_disabled_and_l0_is_full() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_wal_disabled_l0_full";
+
+        let mut settings = test_db_options(0, 1, None);
+        settings.wal_enabled = false;
+        settings.l0_max_ssts = 2;
+
+        let db = Db::builder(path, object_store.clone())
+            .with_settings(settings.clone())
+            .build()
+            .await
+            .unwrap();
+
+        db.put_with_options(
+            b"k1",
+            b"v1",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+            },
+        )
+        .await
+        .unwrap();
+        db.put_with_options(
+            b"k2",
+            b"v2",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let manifest_store = Arc::new(ManifestStore::new(&Path::from(path), object_store.clone()));
+        let mut stored_manifest =
+            StoredManifest::load(manifest_store, Arc::new(DefaultSystemClock::new()))
+                .await
+                .unwrap();
+        wait_for_manifest_condition(
+            &mut stored_manifest,
+            |m| m.l0.len() == 2,
+            Duration::from_secs(30),
+        )
+        .await;
+
+        db.put_with_options(
+            b"k3",
+            b"v3",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let db_state = db.inner.state.read().view();
+        assert_eq!(db_state.state.core().l0.len(), 2);
+        assert_eq!(db_state.state.imm_memtable.len(), 1);
+
+        db.close().await.unwrap();
+
+        let reopened = Db::builder(path, object_store.clone())
+            .with_settings(settings)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.get(b"k1").await.unwrap(),
+            Some(Bytes::from_static(b"v1"))
+        );
+        assert_eq!(
+            reopened.get(b"k2").await.unwrap(),
+            Some(Bytes::from_static(b"v2"))
+        );
+        assert_eq!(
+            reopened.get(b"k3").await.unwrap(),
+            Some(Bytes::from_static(b"v3"))
+        );
+    }
+
+    #[tokio::test]
+    async fn should_catch_l0_up_to_last_wal_on_close_when_wal_enabled_and_l0_is_full() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_wal_enabled_l0_full_close";
+
+        let mut settings = test_db_options(0, 1, None);
+        settings.l0_max_ssts = 2;
+
+        let db = Db::builder(path, object_store.clone())
+            .with_settings(settings.clone())
+            .build()
+            .await
+            .unwrap();
+
+        db.put_with_options(
+            b"k1",
+            b"v1",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+            },
+        )
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+
+        db.put_with_options(
+            b"k2",
+            b"v2",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+            },
+        )
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+
+        let manifest_store = Arc::new(ManifestStore::new(&Path::from(path), object_store.clone()));
+        let mut stored_manifest =
+            StoredManifest::load(manifest_store.clone(), Arc::new(DefaultSystemClock::new()))
+                .await
+                .unwrap();
+        wait_for_manifest_condition(
+            &mut stored_manifest,
+            |m| m.l0.len() == 2,
+            Duration::from_secs(30),
+        )
+        .await;
+
+        db.put_with_options(
+            b"k3",
+            b"v3",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+            },
+        )
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+        db.close().await.unwrap();
+
+        let table_store = Arc::new(TableStore::new(
+            ObjectStores::new(object_store.clone(), None),
+            SsTableFormat::default(),
+            path,
+            None,
+        ));
+
+        let (_, manifest) = manifest_store.read_latest_manifest().await.unwrap();
+        let last_seen_wal_id = table_store
+            .next_wal_sst_id(manifest.core.replay_after_wal_id)
+            .await
+            .unwrap()
+            - 1;
+
+        assert_eq!(manifest.core.l0.len(), 2);
+        assert_eq!(manifest.core.replay_after_wal_id, last_seen_wal_id);
+    }
+
+    #[tokio::test]
     async fn test_recover_clock_tick_from_wal() {
         let clock = Arc::new(MockSystemClock::new());
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
