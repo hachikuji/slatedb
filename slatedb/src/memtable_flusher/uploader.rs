@@ -13,12 +13,23 @@
 
 use super::FlushEpoch;
 use crate::db::DbInner;
-use crate::db_state::{SsTableHandle, SsTableId};
+use crate::db_state::{DbState, SsTableHandle, SsTableId};
+use crate::db_stats::DbStats;
 use crate::error::SlateDBError;
 use crate::format::sst::EncodedSsTable;
-use crate::mem_table::ImmutableMemtable;
+use crate::iter::RowEntryIterator;
+use crate::mem_table::{ImmutableMemtable, KVTable};
+use crate::merge_operator::{MergeOperatorIterator, MergeOperatorRequiredIterator};
+use crate::oracle::{DbOracle, Oracle};
+use crate::rand::DbRand;
+use crate::reader::DbStateReader;
+use crate::retention_iterator::RetentionIterator;
+use crate::stats::StatRegistry;
+use crate::tablestore::TableStore;
+use crate::transaction_manager::TransactionManager;
 use crate::utils::{SendSafely, WatchableOnceCell, WatchableOnceCellReader};
 use parking_lot::Mutex;
+use slatedb_common::clock::SystemClock;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Handle;
@@ -84,6 +95,101 @@ type UploadJobReceiver = Arc<AsyncMutex<mpsc::UnboundedReceiver<UploadJob>>>;
 type UploaderEventSender = mpsc::UnboundedSender<UploaderEvent>;
 type UploaderEventReceiver = mpsc::UnboundedReceiver<UploaderEvent>;
 
+/// Narrow dependency bundle for the SST uploader.
+pub(crate) struct UploaderDb {
+    state: Arc<parking_lot::RwLock<DbState>>,
+    settings: crate::config::Settings,
+    table_store: Arc<TableStore>,
+    db_stats: DbStats,
+    system_clock: Arc<dyn SystemClock>,
+    mono_clock: Arc<crate::clock::MonotonicClock>,
+    rand: Arc<DbRand>,
+    oracle: Arc<DbOracle>,
+    txn_manager: Arc<TransactionManager>,
+    #[allow(dead_code)]
+    stat_registry: Arc<StatRegistry>,
+}
+
+impl UploaderDb {
+    pub(crate) fn from_db_inner(db_inner: &Arc<DbInner>) -> Arc<Self> {
+        Arc::new(Self {
+            state: Arc::clone(&db_inner.state),
+            settings: db_inner.settings.clone(),
+            table_store: Arc::clone(&db_inner.table_store),
+            db_stats: db_inner.db_stats.clone(),
+            system_clock: Arc::clone(&db_inner.system_clock),
+            mono_clock: Arc::clone(&db_inner.mono_clock),
+            rand: Arc::clone(&db_inner.rand),
+            oracle: Arc::clone(&db_inner.oracle),
+            txn_manager: Arc::clone(&db_inner.txn_manager),
+            stat_registry: Arc::clone(&db_inner.stat_registry),
+        })
+    }
+
+    async fn build_imm_sst(&self, imm_table: Arc<KVTable>) -> Result<EncodedSsTable, SlateDBError> {
+        let mut sst_builder = self.table_store.table_builder();
+        let mut iter = self.iter_imm_table(imm_table).await?;
+        while let Some(entry) = iter.next().await? {
+            sst_builder.add(entry).await?;
+        }
+
+        sst_builder.build().await
+    }
+
+    async fn upload_compacted_sst(
+        &self,
+        id: &SsTableId,
+        imm_table: Arc<KVTable>,
+        encoded_sst: EncodedSsTable,
+        write_cache: bool,
+    ) -> Result<SsTableHandle, SlateDBError> {
+        let handle = self
+            .table_store
+            .write_sst(id, encoded_sst, write_cache)
+            .await?;
+        self.mono_clock
+            .fetch_max_last_durable_tick(imm_table.last_tick());
+        Ok(handle)
+    }
+
+    async fn iter_imm_table(
+        &self,
+        imm_table: Arc<KVTable>,
+    ) -> Result<RetentionIterator<Box<dyn RowEntryIterator>>, SlateDBError> {
+        let state = self.state.read().view();
+        let durable_seq = self.oracle.last_remote_persisted_seq();
+        let min_retention_seq = match self.txn_manager.min_active_seq() {
+            Some(active_seq) => Some(active_seq.min(durable_seq)),
+            None => Some(durable_seq),
+        };
+
+        let merge_iter = if let Some(merge_operator) = self.settings.merge_operator.clone() {
+            Box::new(MergeOperatorIterator::new(
+                merge_operator,
+                imm_table.iter(),
+                false,
+                imm_table.last_tick(),
+                min_retention_seq,
+            ))
+        } else {
+            Box::new(MergeOperatorRequiredIterator::new(imm_table.iter()))
+                as Box<dyn RowEntryIterator>
+        };
+        let mut iter = RetentionIterator::new(
+            merge_iter,
+            None,
+            min_retention_seq,
+            false,
+            imm_table.last_tick(),
+            Arc::clone(&self.system_clock),
+            Arc::new(state.core().sequence_tracker.clone()),
+        )
+        .await?;
+        iter.init().await?;
+        Ok(iter)
+    }
+}
+
 pub(crate) struct Uploader {
     jobs: Option<UploadJobSender>,
     events: UploaderEventReceiver,
@@ -100,7 +206,7 @@ impl Uploader {
     /// Upload attempts use a fixed retry backoff. Fatal worker failures poison
     /// the uploader and are emitted as [`UploaderEvent::Fatal`].
     pub(crate) fn start(
-        db_inner: Arc<DbInner>,
+        db: Arc<UploaderDb>,
         worker_count: usize,
         retry_backoff: Duration,
         handle: &Handle,
@@ -115,7 +221,7 @@ impl Uploader {
 
         for worker_id in 0..worker_count {
             let worker = UploadWorker::new(
-                Arc::clone(&db_inner),
+                Arc::clone(&db),
                 shutdown.clone(),
                 retry_backoff,
                 closed_result.reader(),
@@ -277,7 +383,7 @@ impl Uploader {
 }
 
 struct UploadWorker {
-    db_inner: Arc<DbInner>,
+    db: Arc<UploaderDb>,
     shutdown: CancellationToken,
     retry_backoff: Duration,
     closed_result_reader: WatchableOnceCellReader<Result<(), SlateDBError>>,
@@ -285,13 +391,13 @@ struct UploadWorker {
 
 impl UploadWorker {
     fn new(
-        db_inner: Arc<DbInner>,
+        db: Arc<UploaderDb>,
         shutdown: CancellationToken,
         retry_backoff: Duration,
         closed_result_reader: WatchableOnceCellReader<Result<(), SlateDBError>>,
     ) -> Self {
         Self {
-            db_inner,
+            db,
             shutdown,
             retry_backoff,
             closed_result_reader,
@@ -340,7 +446,7 @@ impl UploadWorker {
     }
 
     async fn build_sst(&self, job: &UploadJob) -> Result<EncodedSsTable, SlateDBError> {
-        self.db_inner.build_imm_sst(job.imm_memtable.table()).await
+        self.db.build_imm_sst(job.imm_memtable.table()).await
     }
 
     async fn upload_with_retry(&self, job: UploadJob) -> Result<UploadSuccess, SlateDBError> {
@@ -353,7 +459,7 @@ impl UploadWorker {
                     Err(_) => {
                         tokio::select! {
                             _ = self.shutdown.cancelled() => return Err(SlateDBError::Closed),
-                            _ = self.db_inner.system_clock.sleep(self.retry_backoff) => {}
+                            _ = self.db.system_clock.sleep(self.retry_backoff) => {}
                         }
                     }
                 }
@@ -375,7 +481,7 @@ impl UploadWorker {
             .last_seq()
             .expect("flush of l0 with no entries");
         let sst_handle = self
-            .db_inner
+            .db
             .upload_compacted_sst(&job.sst_id, job.imm_memtable.table(), encoded_sst, true)
             .await?;
 
@@ -391,56 +497,121 @@ impl UploadWorker {
 
 #[cfg(test)]
 mod tests {
-    use super::{FlushEpoch, UploadJob, Uploader, UploaderEvent};
+    use super::{FlushEpoch, UploadJob, Uploader, UploaderDb, UploaderEvent};
     use crate::config::Settings;
-    use crate::db::Db;
-    use crate::db_state::SsTableId;
+    use crate::db::DbInner;
+    use crate::db_state::{ManifestCore, SsTableId};
     use crate::error::SlateDBError;
+    use crate::format::sst::SsTableFormat;
+    use crate::object_stores::ObjectStores;
+    use crate::paths::PathResolver;
+    use crate::rand::DbRand;
+    use crate::stats::StatRegistry;
+    use crate::tablestore::TableStore;
+    use crate::types::RowEntry;
     use crate::utils::IdGenerator;
     use fail_parallel::FailPointRegistry;
     use object_store::memory::InMemory;
+    use object_store::path::Path;
     use object_store::ObjectStore;
+    use slatedb_common::clock::{DefaultSystemClock, SystemClock};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::runtime::Handle;
     use tokio::time::timeout;
 
-    async fn setup_db(path: &str, fp_registry: Arc<FailPointRegistry>) -> Db {
+    struct TestHarness {
+        inner: Arc<DbInner>,
+        db: Arc<UploaderDb>,
+    }
+
+    async fn setup_harness(path: &str, fp_registry: Arc<FailPointRegistry>) -> TestHarness {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        Db::builder(path, object_store)
-            .with_settings(Settings::default())
-            .with_fp_registry(fp_registry)
-            .build()
+        let settings = Settings::default();
+        let system_clock: Arc<dyn SystemClock> = Arc::new(DefaultSystemClock::new());
+        let rand = Arc::new(DbRand::new(42));
+        let stat_registry = Arc::new(StatRegistry::new());
+        let manifest_store = Arc::new(crate::manifest::store::ManifestStore::new(
+            &Path::from(path),
+            Arc::clone(&object_store),
+        ));
+        let stored_manifest = crate::manifest::store::StoredManifest::create_new_db(
+            manifest_store,
+            ManifestCore::new_with_wal_object_store(None),
+            Arc::clone(&system_clock),
+        )
+        .await
+        .unwrap();
+        let table_store = Arc::new(TableStore::new_with_fp_registry(
+            ObjectStores::new(Arc::clone(&object_store), None),
+            SsTableFormat::default(),
+            PathResolver::new(Path::from(path)),
+            fp_registry.clone(),
+            None,
+        ));
+        let (memtable_flush_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (write_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let inner = Arc::new(
+            DbInner::new(
+                settings,
+                Arc::clone(&system_clock),
+                Arc::clone(&rand),
+                Arc::clone(&table_store),
+                stored_manifest.prepare_dirty().unwrap(),
+                memtable_flush_tx,
+                write_tx,
+                Arc::clone(&stat_registry),
+                fp_registry,
+                None,
+            )
             .await
-            .unwrap()
+            .unwrap(),
+        );
+        let db = UploaderDb::from_db_inner(&inner);
+        TestHarness { inner, db }
     }
 
-    fn freeze_imm(db: &Db) -> Arc<crate::mem_table::ImmutableMemtable> {
-        let recent_flushed_wal_id = db.inner.wal_buffer.recent_flushed_wal_id();
-        let mut guard = db.inner.state.write();
-        guard.freeze_memtable(recent_flushed_wal_id).unwrap();
-        guard.state().imm_memtable.back().cloned().unwrap()
+    fn freeze_imm(
+        harness: &TestHarness,
+        key: &[u8],
+        value: &[u8],
+        seq: u64,
+    ) -> Arc<crate::mem_table::ImmutableMemtable> {
+        let mut guard = harness.inner.state.write();
+        guard.memtable().put(RowEntry::new_value(key, value, seq));
+        guard.freeze_memtable(0).unwrap();
+        guard.state().imm_memtable.front().cloned().unwrap()
     }
 
-    fn next_upload_job(db: &Db, epoch: u64) -> UploadJob {
-        let imm_memtable = freeze_imm(db);
-        let sst_id =
-            SsTableId::Compacted(db.inner.rand.rng().gen_ulid(db.inner.system_clock.as_ref()));
+    fn next_upload_job(
+        harness: &TestHarness,
+        epoch: u64,
+        key: &[u8],
+        value: &[u8],
+        seq: u64,
+    ) -> UploadJob {
+        let imm_memtable = freeze_imm(harness, key, value, seq);
+        let sst_id = SsTableId::Compacted(
+            harness
+                .db
+                .rand
+                .rng()
+                .gen_ulid(harness.db.system_clock.as_ref()),
+        );
         UploadJob::new(FlushEpoch(epoch), imm_memtable, sst_id)
     }
 
     #[tokio::test]
     async fn should_emit_uploaded_event_for_successful_job() {
-        let db = setup_db(
+        let harness = setup_harness(
             "/tmp/test_parallel_l0_flush_uploader_success",
             Arc::new(FailPointRegistry::new()),
         )
         .await;
-        db.put(b"key", b"value").await.unwrap();
-        let job = next_upload_job(&db, 1);
+        let job = next_upload_job(&harness, 1, b"key", b"value", 1);
 
         let mut uploader = Uploader::start(
-            Arc::clone(&db.inner),
+            Arc::clone(&harness.db),
             1,
             Duration::from_millis(1),
             &Handle::current(),
@@ -460,7 +631,6 @@ mod tests {
         }
 
         uploader.close().await.unwrap();
-        db.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -472,12 +642,12 @@ mod tests {
             "1*off->return",
         )
         .unwrap();
-        let db = setup_db("/tmp/test_parallel_l0_flush_uploader_retry", fp_registry).await;
-        db.put(b"key", b"value").await.unwrap();
-        let job = next_upload_job(&db, 7);
+        let harness =
+            setup_harness("/tmp/test_parallel_l0_flush_uploader_retry", fp_registry).await;
+        let job = next_upload_job(&harness, 7, b"key", b"value", 1);
 
         let mut uploader = Uploader::start(
-            Arc::clone(&db.inner),
+            Arc::clone(&harness.db),
             1,
             Duration::from_millis(1),
             &Handle::current(),
@@ -496,21 +666,44 @@ mod tests {
         }
 
         uploader.close().await.unwrap();
-        db.close().await.unwrap();
     }
 
     #[tokio::test]
     async fn should_emit_fatal_event_for_build_failure() {
-        let db = setup_db(
+        let harness = setup_harness(
             "/tmp/test_parallel_l0_flush_uploader_build_failure",
             Arc::new(FailPointRegistry::new()),
         )
         .await;
-        db.merge(b"key", b"merge_operand").await.unwrap();
-        let job = next_upload_job(&db, 3);
+        {
+            let mut guard = harness.inner.state.write();
+            guard.memtable().put(crate::types::RowEntry::new_merge(
+                b"key",
+                b"merge_operand",
+                1,
+            ));
+            guard.freeze_memtable(0).unwrap();
+        }
+        let imm_memtable = harness
+            .inner
+            .state
+            .read()
+            .state()
+            .imm_memtable
+            .front()
+            .cloned()
+            .unwrap();
+        let sst_id = SsTableId::Compacted(
+            harness
+                .db
+                .rand
+                .rng()
+                .gen_ulid(harness.db.system_clock.as_ref()),
+        );
+        let job = UploadJob::new(FlushEpoch(3), imm_memtable, sst_id);
 
         let mut uploader = Uploader::start(
-            Arc::clone(&db.inner),
+            Arc::clone(&harness.db),
             1,
             Duration::from_millis(1),
             &Handle::current(),
@@ -523,28 +716,28 @@ mod tests {
             .unwrap();
         assert!(matches!(event, UploaderEvent::Fatal(_)));
 
-        let err = uploader.submit(next_upload_job(&db, 4)).await.unwrap_err();
+        let err = uploader
+            .submit(next_upload_job(&harness, 4, b"key2", b"value2", 2))
+            .await
+            .unwrap_err();
         assert!(!matches!(err, SlateDBError::Closed));
 
         let close_result = uploader.close().await;
         assert!(close_result.is_err());
-        db.close().await.unwrap();
     }
 
     #[tokio::test]
     async fn close_should_drain_queued_jobs() {
-        let db = setup_db(
+        let harness = setup_harness(
             "/tmp/test_parallel_l0_flush_uploader_close_drains",
             Arc::new(FailPointRegistry::new()),
         )
         .await;
-        db.put(b"key1", b"value1").await.unwrap();
-        let job1 = next_upload_job(&db, 1);
-        db.put(b"key2", b"value2").await.unwrap();
-        let job2 = next_upload_job(&db, 2);
+        let job1 = next_upload_job(&harness, 1, b"key1", b"value1", 1);
+        let job2 = next_upload_job(&harness, 2, b"key2", b"value2", 2);
 
         let mut uploader = Uploader::start(
-            Arc::clone(&db.inner),
+            Arc::clone(&harness.db),
             1,
             Duration::from_millis(1),
             &Handle::current(),
@@ -563,6 +756,5 @@ mod tests {
         }
 
         assert_eq!(uploaded_epochs, vec![FlushEpoch(1), FlushEpoch(2)]);
-        db.close().await.unwrap();
     }
 }
