@@ -121,6 +121,8 @@ mod merge_iterator;
 mod merge_operator;
 mod object_stores;
 mod oracle;
+#[allow(dead_code)]
+mod parallel_l0_flush;
 mod partitioned_keyspace;
 mod paths;
 mod peeking_iterator;
