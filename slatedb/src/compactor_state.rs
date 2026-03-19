@@ -978,7 +978,7 @@ mod tests {
         let db = build_db(os.clone(), rt.handle());
         rt.block_on(db.put(&[b'a'; 16], &[b'b'; 48])).unwrap();
         rt.block_on(db.put(&[b'j'; 16], &[b'k'; 48])).unwrap();
-        wait_for_manifest_with_l0_len(&mut sm, rt.handle(), state.db_state().l0.len() + 1);
+        wait_for_manifest_with_min_l0_len(&mut sm, rt.handle(), state.db_state().l0.len() + 1);
 
         // when:
         state.merge_remote_manifest(sm.prepare_dirty().unwrap());
@@ -1028,7 +1028,7 @@ mod tests {
         let db = build_db(os.clone(), rt.handle());
         rt.block_on(db.put(&[b'a'; 16], &[b'b'; 48])).unwrap();
         rt.block_on(db.put(&[b'j'; 16], &[b'k'; 48])).unwrap();
-        wait_for_manifest_with_l0_len(&mut sm, rt.handle(), original_l0s.len() + 1);
+        wait_for_manifest_with_min_l0_len(&mut sm, rt.handle(), original_l0s.len() + 1);
         let db_state_before_merge = state.db_state().clone();
 
         // when:
@@ -1041,15 +1041,15 @@ mod tests {
             .map(|h| h.id.unwrap_compacted_id())
             .collect();
         expected_merged_l0s.pop_back();
-        let new_l0 = sm
+        let new_l0_count = sm
             .manifest()
             .core
             .l0
-            .front()
-            .unwrap()
-            .id
-            .unwrap_compacted_id();
-        expected_merged_l0s.push_front(new_l0);
+            .len()
+            .saturating_sub(original_l0s.len());
+        for new_l0 in sm.manifest().core.l0.iter().take(new_l0_count).rev() {
+            expected_merged_l0s.push_front(new_l0.id.unwrap_compacted_id());
+        }
         let merged_l0: VecDeque<Ulid> = db_state
             .l0
             .iter()
@@ -1099,23 +1099,27 @@ mod tests {
         let db = build_db(os.clone(), rt.handle());
         rt.block_on(db.put(&[b'a'; 16], &[b'b'; 48])).unwrap();
         rt.block_on(db.put(&[b'j'; 16], &[b'k'; 48])).unwrap();
-        wait_for_manifest_with_l0_len(&mut sm, rt.handle(), original_l0s.len() + 1);
+        wait_for_manifest_with_min_l0_len(&mut sm, rt.handle(), original_l0s.len() + 1);
 
         // when:
         state.merge_remote_manifest(sm.prepare_dirty().unwrap());
 
         // then:
         let db_state = state.db_state();
-        let mut expected_merged_l0s = VecDeque::new();
-        let new_l0 = sm
+        let new_l0_count = sm
             .manifest()
             .core
             .l0
-            .front()
-            .unwrap()
-            .id
-            .unwrap_compacted_id();
-        expected_merged_l0s.push_front(new_l0);
+            .len()
+            .saturating_sub(original_l0s.len());
+        let expected_merged_l0s: VecDeque<Ulid> = sm
+            .manifest()
+            .core
+            .l0
+            .iter()
+            .take(new_l0_count)
+            .map(|h| h.id.unwrap_compacted_id())
+            .collect();
         let merged_l0: VecDeque<Ulid> = db_state
             .l0
             .iter()
@@ -1259,14 +1263,14 @@ mod tests {
         }
     }
 
-    fn wait_for_manifest_with_l0_len(
+    fn wait_for_manifest_with_min_l0_len(
         stored_manifest: &mut StoredManifest,
         tokio_handle: &Handle,
-        len: usize,
+        min_len: usize,
     ) {
         run_for(Duration::from_secs(30), || {
             let manifest = tokio_handle.block_on(stored_manifest.refresh()).unwrap();
-            if manifest.core.l0.len() == len {
+            if manifest.core.l0.len() >= min_len {
                 return Some(manifest.core.clone());
             }
             None

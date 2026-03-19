@@ -665,13 +665,11 @@ impl SequencerTask {
         {
             let _ = checkpoint.sender.send(Ok(result));
         }
-        self.events.send_safely(
-            self.closed_result.reader(),
-            SequencerEvent::Flushed {
-                through_epoch,
-                through_seq,
-            },
-        )?;
+        #[allow(clippy::disallowed_methods)]
+        let _ = self.events.send(SequencerEvent::Flushed {
+            through_epoch,
+            through_seq,
+        });
         Ok(())
     }
 

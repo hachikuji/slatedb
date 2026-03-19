@@ -286,31 +286,48 @@ impl FlusherTask {
     async fn run(mut self) -> Result<(), SlateDBError> {
         let mut poll = time::interval(self.db.inner.settings.manifest_poll_interval);
         loop {
-            tokio::select! {
-                _ = poll.tick() => {
-                    self.reconcile_and_dispatch().await?;
-                }
-                maybe_command = self.commands.recv() => {
-                    let Some(command) = maybe_command else {
-                        let uploader_result = self.uploader.close().await;
-                        let sequencer_result = self.sequencer.close().await;
-                        uploader_result?;
-                        sequencer_result?;
-                        return Ok(());
-                    };
+            let should_continue = match self.run_once(&mut poll).await {
+                Ok(should_continue) => should_continue,
+                Err(err) => return self.handle_fatal_error(err).await,
+            };
+            if !should_continue {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn run_once(&mut self, poll: &mut time::Interval) -> Result<bool, SlateDBError> {
+        tokio::select! {
+            _ = poll.tick() => {
+                self.reconcile_and_dispatch().await?;
+                Ok(true)
+            }
+            maybe_command = self.commands.recv() => {
+                if let Some(command) = maybe_command {
                     self.handle_command(command).await?;
+                    Ok(true)
+                } else {
+                    let uploader_result = self.uploader.close().await;
+                    let sequencer_result = self.sequencer.close().await;
+                    uploader_result?;
+                    sequencer_result?;
+                    Ok(false)
                 }
-                maybe_event = self.uploader.events().recv() => {
-                    let Some(event) = maybe_event else {
-                        return self.handle_fatal_error(SlateDBError::Closed).await;
-                    };
+            }
+            maybe_event = self.uploader.events().recv() => {
+                if let Some(event) = maybe_event {
                     self.handle_uploader_event(event).await?;
+                    Ok(true)
+                } else {
+                    Err(SlateDBError::Closed)
                 }
-                maybe_event = self.sequencer.events().recv() => {
-                    let Some(event) = maybe_event else {
-                        return self.handle_fatal_error(SlateDBError::Closed).await;
-                    };
+            }
+            maybe_event = self.sequencer.events().recv() => {
+                if let Some(event) = maybe_event {
                     self.handle_sequencer_event(event).await?;
+                    Ok(true)
+                } else {
+                    Err(SlateDBError::Closed)
                 }
             }
         }

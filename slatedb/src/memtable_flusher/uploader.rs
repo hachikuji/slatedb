@@ -431,14 +431,11 @@ impl UploadWorker {
                     };
 
                     let success = self.upload_with_retry(job).await?;
-                    if events
-                        .send_safely(
-                            self.closed_result_reader.clone(),
-                            UploaderEvent::Uploaded(Box::new(success)),
-                        )
-                        .is_err()
-                    {
-                        return Err(SlateDBError::Closed);
+                    #[allow(clippy::disallowed_methods)]
+                    if events.send(UploaderEvent::Uploaded(Box::new(success))).is_err() {
+                        // The flusher is no longer listening for uploader events, so
+                        // treat this as normal shutdown rather than panicking.
+                        return Ok(());
                     }
                 }
             }
