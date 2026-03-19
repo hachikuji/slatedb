@@ -80,13 +80,13 @@ impl MemtableFlusherDb {
 
 /// Parallel L0 memtable flusher subsystem.
 pub(crate) struct MemtableFlusher {
-    commands: Mutex<Option<OrchestratorCommandSender>>,
+    commands: Mutex<Option<FlusherCommandSender>>,
     poisoned: Arc<Mutex<Option<SlateDBError>>>,
     closed_result: WatchableOnceCell<Result<(), SlateDBError>>,
     task: Mutex<Option<JoinHandle<Result<(), SlateDBError>>>>,
 }
 
-enum OrchestratorCommand {
+enum FlusherCommand {
     Flush {
         target: FlushTarget,
         sender: Option<oneshot::Sender<Result<FlushResult, SlateDBError>>>,
@@ -98,8 +98,8 @@ enum OrchestratorCommand {
     },
 }
 
-type OrchestratorCommandSender = mpsc::UnboundedSender<OrchestratorCommand>;
-type OrchestratorCommandReceiver = mpsc::UnboundedReceiver<OrchestratorCommand>;
+type FlusherCommandSender = mpsc::UnboundedSender<FlusherCommand>;
+type FlusherCommandReceiver = mpsc::UnboundedReceiver<FlusherCommand>;
 
 impl MemtableFlusher {
     /// Starts the memtable flusher subsystem.
@@ -128,7 +128,7 @@ impl MemtableFlusher {
         let poisoned = Arc::new(Mutex::new(None));
         let closed_result = WatchableOnceCell::new();
         let task = handle.spawn(
-            OrchestratorTask::new(
+            FlusherTask::new(
                 db,
                 uploader,
                 sequencer,
@@ -159,7 +159,7 @@ impl MemtableFlusher {
             .ok_or(SlateDBError::Closed)?
             .send_safely(
                 self.closed_result.reader(),
-                OrchestratorCommand::Flush {
+                FlusherCommand::Flush {
                     target,
                     sender: Some(tx),
                 },
@@ -176,7 +176,7 @@ impl MemtableFlusher {
             return Err(SlateDBError::Closed);
         };
         #[allow(clippy::disallowed_methods)]
-        match commands.send(OrchestratorCommand::Flush {
+        match commands.send(FlusherCommand::Flush {
             target,
             sender: None,
         }) {
@@ -210,7 +210,7 @@ impl MemtableFlusher {
             .ok_or(SlateDBError::Closed)?
             .send_safely(
                 self.closed_result.reader(),
-                OrchestratorCommand::CreateCheckpoint {
+                FlusherCommand::CreateCheckpoint {
                     target,
                     options,
                     sender: tx,
@@ -242,13 +242,13 @@ impl MemtableFlusher {
     }
 }
 
-struct OrchestratorTask {
+struct FlusherTask {
     db: Arc<MemtableFlusherDb>,
     uploader: Uploader,
     sequencer: Sequencer,
     poisoned: Arc<Mutex<Option<SlateDBError>>>,
     closed_result: WatchableOnceCell<Result<(), SlateDBError>>,
-    commands: OrchestratorCommandReceiver,
+    commands: FlusherCommandReceiver,
     next_epoch: FlushEpoch,
     tracked_imms: VecDeque<TrackedImm>,
     durable_state: DurableState,
@@ -257,14 +257,14 @@ struct OrchestratorTask {
     durable_l0_len: usize,
 }
 
-impl OrchestratorTask {
+impl FlusherTask {
     fn new(
         db: Arc<MemtableFlusherDb>,
         uploader: Uploader,
         sequencer: Sequencer,
         poisoned: Arc<Mutex<Option<SlateDBError>>>,
         closed_result: WatchableOnceCell<Result<(), SlateDBError>>,
-        commands: OrchestratorCommandReceiver,
+        commands: FlusherCommandReceiver,
     ) -> Self {
         Self {
             db,
@@ -316,9 +316,9 @@ impl OrchestratorTask {
         }
     }
 
-    async fn handle_command(&mut self, command: OrchestratorCommand) -> Result<(), SlateDBError> {
+    async fn handle_command(&mut self, command: FlusherCommand) -> Result<(), SlateDBError> {
         match command {
-            OrchestratorCommand::Flush { target, sender } => {
+            FlusherCommand::Flush { target, sender } => {
                 fail_point!(
                     Arc::clone(&self.db.inner.fp_registry),
                     "flush-memtable-to-l0"
@@ -328,7 +328,7 @@ impl OrchestratorTask {
                 self.reconcile_and_dispatch().await?;
                 result
             }
-            OrchestratorCommand::CreateCheckpoint {
+            FlusherCommand::CreateCheckpoint {
                 target,
                 options,
                 sender,
@@ -347,66 +347,22 @@ impl OrchestratorTask {
         target: FlushTarget,
         sender: Option<oneshot::Sender<Result<FlushResult, SlateDBError>>>,
     ) -> Result<(), SlateDBError> {
-        match target {
-            FlushTarget::BestEffort => {
+        match self.resolve_target(target) {
+            TargetResolution::Immediate => {
                 if let Some(sender) = sender {
                     let _ = sender.send(Ok(self.flush_result()));
                 }
-                Ok(())
             }
-            FlushTarget::CurrentDurable => {
-                if let Some(sender) = sender {
-                    let _ = sender.send(Ok(self.flush_result()));
-                }
-                Ok(())
-            }
-            FlushTarget::ThroughWalId(required_wal_id) => {
-                if self
-                    .durable_state
-                    .wal_id
-                    .is_some_and(|durable_wal_id| durable_wal_id >= required_wal_id)
-                {
-                    if let Some(sender) = sender {
-                        let _ = sender.send(Ok(self.flush_result()));
-                    }
-                    return Ok(());
-                }
+            TargetResolution::Wait(requirement) => {
                 if let Some(sender) = sender {
                     self.pending_flushes.push(PendingFlush {
-                        requirement: FlushRequirement::WalId(required_wal_id),
+                        requirement,
                         sender,
                     });
                 }
-                Ok(())
-            }
-            FlushTarget::ThroughCurrentImm => {
-                self.register_new_imm_memtables();
-                let Some(required_epoch) = self.tracked_imms.back().map(|tracked| tracked.epoch)
-                else {
-                    if let Some(sender) = sender {
-                        let _ = sender.send(Ok(self.flush_result()));
-                    }
-                    return Ok(());
-                };
-                if self
-                    .durable_state
-                    .epoch
-                    .is_some_and(|durable_epoch| durable_epoch >= required_epoch)
-                {
-                    if let Some(sender) = sender {
-                        let _ = sender.send(Ok(self.flush_result()));
-                    }
-                    return Ok(());
-                }
-                if let Some(sender) = sender {
-                    self.pending_flushes.push(PendingFlush {
-                        requirement: FlushRequirement::Epoch(required_epoch),
-                        sender,
-                    });
-                }
-                Ok(())
             }
         }
+        Ok(())
     }
 
     async fn handle_checkpoint_request(
@@ -415,58 +371,51 @@ impl OrchestratorTask {
         options: CheckpointOptions,
         sender: oneshot::Sender<Result<CheckpointCreateResult, SlateDBError>>,
     ) -> Result<(), SlateDBError> {
-        match target {
-            FlushTarget::BestEffort => {
+        match self.resolve_target(target) {
+            TargetResolution::Immediate => {
                 let result = self.sequencer.create_checkpoint(None, options).await;
                 let _ = sender.send(result);
-                Ok(())
             }
-            FlushTarget::CurrentDurable => {
-                let result = self.sequencer.create_checkpoint(None, options).await;
-                let _ = sender.send(result);
-                Ok(())
-            }
-            FlushTarget::ThroughWalId(required_wal_id) => {
-                self.register_new_imm_memtables();
-                if self
-                    .durable_state
-                    .wal_id
-                    .is_some_and(|durable| durable >= required_wal_id)
-                {
-                    let result = self.sequencer.create_checkpoint(None, options).await;
-                    let _ = sender.send(result);
-                    return Ok(());
-                }
+            TargetResolution::Wait(requirement) => {
                 self.pending_checkpoints.push(PendingCheckpoint {
-                    requirement: FlushRequirement::WalId(required_wal_id),
+                    requirement,
                     options,
                     sender,
                 });
-                Ok(())
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_target(&mut self, target: FlushTarget) -> TargetResolution {
+        match target {
+            FlushTarget::BestEffort | FlushTarget::CurrentDurable => TargetResolution::Immediate,
+            FlushTarget::ThroughWalId(required_wal_id) => {
+                if self
+                    .durable_state
+                    .wal_id
+                    .is_some_and(|durable_wal_id| durable_wal_id >= required_wal_id)
+                {
+                    TargetResolution::Immediate
+                } else {
+                    TargetResolution::Wait(FlushRequirement::WalId(required_wal_id))
+                }
             }
             FlushTarget::ThroughCurrentImm => {
                 self.register_new_imm_memtables();
                 let Some(required_epoch) = self.tracked_imms.back().map(|tracked| tracked.epoch)
                 else {
-                    let result = self.sequencer.create_checkpoint(None, options).await;
-                    let _ = sender.send(result);
-                    return Ok(());
+                    return TargetResolution::Immediate;
                 };
                 if self
                     .durable_state
                     .epoch
                     .is_some_and(|durable_epoch| durable_epoch >= required_epoch)
                 {
-                    let result = self.sequencer.create_checkpoint(None, options).await;
-                    let _ = sender.send(result);
-                    return Ok(());
+                    TargetResolution::Immediate
+                } else {
+                    TargetResolution::Wait(FlushRequirement::Epoch(required_epoch))
                 }
-                self.pending_checkpoints.push(PendingCheckpoint {
-                    requirement: FlushRequirement::Epoch(required_epoch),
-                    options,
-                    sender,
-                });
-                Ok(())
             }
         }
     }
@@ -749,6 +698,11 @@ enum FlushRequirement {
     Epoch(FlushEpoch),
 }
 
+enum TargetResolution {
+    Immediate,
+    Wait(FlushRequirement),
+}
+
 #[cfg(test)]
 mod tests {
     use super::{FlushTarget, MemtableFlusher, MemtableFlusherDb};
@@ -779,7 +733,7 @@ mod tests {
 
     struct TestHarness {
         inner: Arc<DbInner>,
-        orchestrator_db: Arc<MemtableFlusherDb>,
+        flusher_db: Arc<MemtableFlusherDb>,
         uploader_db: Arc<UploaderDb>,
         sequencer_db: Arc<SequencerDb>,
         manifest: FenceableManifest,
@@ -849,7 +803,7 @@ mod tests {
         .unwrap();
 
         TestHarness {
-            orchestrator_db: MemtableFlusherDb::new(Arc::clone(&inner), Some(reader)),
+            flusher_db: MemtableFlusherDb::new(Arc::clone(&inner), Some(reader)),
             uploader_db: UploaderDb::from_db_inner(&inner),
             sequencer_db: SequencerDb::from_db_inner(&inner),
             inner,
@@ -945,7 +899,7 @@ mod tests {
         });
     }
 
-    fn start_orchestrator(harness: TestHarness) -> MemtableFlusher {
+    fn start_flusher(harness: TestHarness) -> MemtableFlusher {
         let uploader = Uploader::start(
             Arc::clone(&harness.uploader_db),
             1,
@@ -958,14 +912,14 @@ mod tests {
             &Handle::current(),
         );
         MemtableFlusher::start_with_db(
-            Arc::clone(&harness.orchestrator_db),
+            Arc::clone(&harness.flusher_db),
             uploader,
             sequencer,
             &Handle::current(),
         )
     }
 
-    fn start_orchestrator_without_reader(harness: TestHarness) -> MemtableFlusher {
+    fn start_flusher_without_reader(harness: TestHarness) -> MemtableFlusher {
         let uploader = Uploader::start(
             Arc::clone(&harness.uploader_db),
             1,
@@ -988,17 +942,17 @@ mod tests {
     #[tokio::test]
     async fn best_effort_returns_immediately() {
         let harness = setup_harness(
-            "/tmp/test_parallel_l0_flush_orchestrator_best_effort",
+            "/tmp/test_parallel_l0_flush_flusher_best_effort",
             Settings::default(),
             Arc::new(FailPointRegistry::new()),
         )
         .await;
         freeze_value_imm(&harness, b"k1", b"v1", 1, 11);
-        let orchestrator = start_orchestrator(harness);
+        let flusher = start_flusher(harness);
 
         let result = timeout(
             Duration::from_secs(5),
-            orchestrator.flush(FlushTarget::BestEffort),
+            flusher.flush(FlushTarget::BestEffort),
         )
         .await
         .unwrap()
@@ -1007,23 +961,23 @@ mod tests {
         assert_eq!(result.durable_through_wal_id, None);
         assert_eq!(result.durable_through_seq, None);
 
-        orchestrator.close().await.unwrap();
+        flusher.close().await.unwrap();
     }
 
     #[tokio::test]
     async fn through_wal_id_waits_for_durable_upload() {
         let harness = setup_harness(
-            "/tmp/test_parallel_l0_flush_orchestrator_through_wal_id",
+            "/tmp/test_parallel_l0_flush_flusher_through_wal_id",
             Settings::default(),
             Arc::new(FailPointRegistry::new()),
         )
         .await;
         freeze_value_imm(&harness, b"k1", b"v1", 1, 11);
-        let orchestrator = start_orchestrator(harness);
+        let flusher = start_flusher(harness);
 
         let result = timeout(
             Duration::from_secs(5),
-            orchestrator.flush(FlushTarget::ThroughWalId(11)),
+            flusher.flush(FlushTarget::ThroughWalId(11)),
         )
         .await
         .unwrap()
@@ -1032,24 +986,24 @@ mod tests {
         assert_eq!(result.durable_through_wal_id, Some(11));
         assert_eq!(result.durable_through_seq, Some(1));
 
-        orchestrator.close().await.unwrap();
+        flusher.close().await.unwrap();
     }
 
     #[tokio::test]
     async fn through_current_imm_waits_for_durable_upload() {
         let harness = setup_harness(
-            "/tmp/test_parallel_l0_flush_orchestrator_through_current_imm",
+            "/tmp/test_parallel_l0_flush_flusher_through_current_imm",
             Settings::default(),
             Arc::new(FailPointRegistry::new()),
         )
         .await;
         freeze_value_imm(&harness, b"k1", b"v1", 1, 0);
         freeze_value_imm(&harness, b"k2", b"v2", 2, 0);
-        let orchestrator = start_orchestrator(harness);
+        let flusher = start_flusher(harness);
 
         let result = timeout(
             Duration::from_secs(5),
-            orchestrator.flush(FlushTarget::ThroughCurrentImm),
+            flusher.flush(FlushTarget::ThroughCurrentImm),
         )
         .await
         .unwrap()
@@ -1058,28 +1012,28 @@ mod tests {
         assert_eq!(result.durable_through_wal_id, Some(0));
         assert_eq!(result.durable_through_seq, Some(2));
 
-        orchestrator.close().await.unwrap();
+        flusher.close().await.unwrap();
     }
 
     #[tokio::test]
     async fn should_resolve_multiple_flush_waiters_on_one_durable_advance() {
         let harness = setup_harness(
-            "/tmp/test_parallel_l0_flush_orchestrator_multiple_waiters",
+            "/tmp/test_parallel_l0_flush_flusher_multiple_waiters",
             Settings::default(),
             Arc::new(FailPointRegistry::new()),
         )
         .await;
         freeze_value_imm(&harness, b"k1", b"v1", 1, 15);
-        let orchestrator = start_orchestrator(harness);
+        let flusher = start_flusher(harness);
 
         let (first, second) = tokio::join!(
             timeout(
                 Duration::from_secs(5),
-                orchestrator.flush(FlushTarget::ThroughWalId(15))
+                flusher.flush(FlushTarget::ThroughWalId(15))
             ),
             timeout(
                 Duration::from_secs(5),
-                orchestrator.flush(FlushTarget::ThroughWalId(15))
+                flusher.flush(FlushTarget::ThroughWalId(15))
             )
         );
 
@@ -1089,13 +1043,13 @@ mod tests {
         assert_eq!(first.durable_through_seq, Some(1));
         assert_eq!(second, first);
 
-        orchestrator.close().await.unwrap();
+        flusher.close().await.unwrap();
     }
 
     #[tokio::test]
     async fn checkpoint_current_imm_waits_for_flush_barrier() {
         let harness = setup_harness(
-            "/tmp/test_parallel_l0_flush_orchestrator_checkpoint_current_imm",
+            "/tmp/test_parallel_l0_flush_flusher_checkpoint_current_imm",
             Settings::default(),
             Arc::new(FailPointRegistry::new()),
         )
@@ -1106,12 +1060,11 @@ mod tests {
                 .await;
         let path = harness.path.clone();
         let object_store = Arc::clone(&harness.object_store);
-        let orchestrator = start_orchestrator(harness);
+        let flusher = start_flusher(harness);
 
         let checkpoint = timeout(
             Duration::from_secs(5),
-            orchestrator
-                .create_checkpoint(FlushTarget::ThroughCurrentImm, CheckpointOptions::default()),
+            flusher.create_checkpoint(FlushTarget::ThroughCurrentImm, CheckpointOptions::default()),
         )
         .await
         .unwrap()
@@ -1121,13 +1074,13 @@ mod tests {
         assert!(checkpoint.manifest_id > 0);
         assert_eq!(after, before + 1);
 
-        orchestrator.close().await.unwrap();
+        flusher.close().await.unwrap();
     }
 
     #[tokio::test]
     async fn checkpoint_all_waits_for_flush_barrier() {
         let harness = setup_harness(
-            "/tmp/test_parallel_l0_flush_orchestrator_checkpoint_all",
+            "/tmp/test_parallel_l0_flush_flusher_checkpoint_all",
             Settings::default(),
             Arc::new(FailPointRegistry::new()),
         )
@@ -1138,12 +1091,11 @@ mod tests {
                 .await;
         let path = harness.path.clone();
         let object_store = Arc::clone(&harness.object_store);
-        let orchestrator = start_orchestrator(harness);
+        let flusher = start_flusher(harness);
 
         let checkpoint = timeout(
             Duration::from_secs(5),
-            orchestrator
-                .create_checkpoint(FlushTarget::ThroughWalId(21), CheckpointOptions::default()),
+            flusher.create_checkpoint(FlushTarget::ThroughWalId(21), CheckpointOptions::default()),
         )
         .await
         .unwrap()
@@ -1153,7 +1105,7 @@ mod tests {
         assert!(checkpoint.manifest_id > 0);
         assert_eq!(after, before + 1);
 
-        orchestrator.close().await.unwrap();
+        flusher.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -1164,7 +1116,7 @@ mod tests {
             ..Settings::default()
         };
         let harness = setup_harness(
-            "/tmp/test_parallel_l0_flush_orchestrator_checkpoint_l0_backpressure",
+            "/tmp/test_parallel_l0_flush_flusher_checkpoint_l0_backpressure",
             settings,
             Arc::new(FailPointRegistry::new()),
         )
@@ -1176,10 +1128,10 @@ mod tests {
                 .await;
         let path = harness.path.clone();
         let object_store = Arc::clone(&harness.object_store);
-        let orchestrator = start_orchestrator(harness);
+        let flusher = start_flusher(harness);
 
         {
-            let checkpoint = orchestrator
+            let checkpoint = flusher
                 .create_checkpoint(FlushTarget::ThroughWalId(61), CheckpointOptions::default());
             tokio::pin!(checkpoint);
             assert!(timeout(Duration::from_millis(100), &mut checkpoint)
@@ -1200,30 +1152,30 @@ mod tests {
             assert_eq!(after, before + 1);
         }
 
-        orchestrator.close().await.unwrap();
+        flusher.close().await.unwrap();
     }
 
     #[tokio::test]
     async fn fatal_upload_failure_propagates_to_flush_waiter() {
         let harness = setup_harness(
-            "/tmp/test_parallel_l0_flush_orchestrator_build_failure",
+            "/tmp/test_parallel_l0_flush_flusher_build_failure",
             Settings::default(),
             Arc::new(FailPointRegistry::new()),
         )
         .await;
         freeze_merge_imm(&harness, b"k1", b"merge", 1, 31);
-        let orchestrator = start_orchestrator(harness);
+        let flusher = start_flusher(harness);
 
         let err = timeout(
             Duration::from_secs(5),
-            orchestrator.flush(FlushTarget::ThroughWalId(31)),
+            flusher.flush(FlushTarget::ThroughWalId(31)),
         )
         .await
         .unwrap()
         .unwrap_err();
         assert!(!matches!(err, SlateDBError::Closed));
 
-        let close_result = orchestrator.close().await;
+        let close_result = flusher.close().await;
         assert!(close_result.is_err());
     }
 
@@ -1235,7 +1187,7 @@ mod tests {
             ..Settings::default()
         };
         let harness = setup_harness(
-            "/tmp/test_parallel_l0_flush_orchestrator_l0_backpressure",
+            "/tmp/test_parallel_l0_flush_flusher_l0_backpressure",
             settings,
             Arc::new(FailPointRegistry::new()),
         )
@@ -1244,10 +1196,10 @@ mod tests {
         freeze_value_imm(&harness, b"k1", b"v1", 1, 41);
         let path = harness.path.clone();
         let object_store = Arc::clone(&harness.object_store);
-        let orchestrator = start_orchestrator(harness);
+        let flusher = start_flusher(harness);
 
         {
-            let flush = orchestrator.flush(FlushTarget::ThroughWalId(41));
+            let flush = flusher.flush(FlushTarget::ThroughWalId(41));
             tokio::pin!(flush);
             assert!(timeout(Duration::from_millis(100), &mut flush)
                 .await
@@ -1263,7 +1215,7 @@ mod tests {
             assert_eq!(result.durable_through_seq, Some(1));
         }
 
-        orchestrator.close().await.unwrap();
+        flusher.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -1274,7 +1226,7 @@ mod tests {
             ..Settings::default()
         };
         let harness = setup_harness(
-            "/tmp/test_parallel_l0_flush_orchestrator_local_l0_fallback",
+            "/tmp/test_parallel_l0_flush_flusher_local_l0_fallback",
             settings,
             Arc::new(FailPointRegistry::new()),
         )
@@ -1282,10 +1234,10 @@ mod tests {
         set_local_l0_len(&harness, 1);
         freeze_value_imm(&harness, b"k1", b"v1", 1, 71);
         let inner = Arc::clone(&harness.inner);
-        let orchestrator = start_orchestrator_without_reader(harness);
+        let flusher = start_flusher_without_reader(harness);
 
         {
-            let flush = orchestrator.flush(FlushTarget::ThroughWalId(71));
+            let flush = flusher.flush(FlushTarget::ThroughWalId(71));
             tokio::pin!(flush);
             assert!(timeout(Duration::from_millis(100), &mut flush)
                 .await
@@ -1303,6 +1255,6 @@ mod tests {
             assert_eq!(result.durable_through_wal_id, Some(71));
             assert_eq!(result.durable_through_seq, Some(1));
         }
-        orchestrator.close().await.unwrap();
+        flusher.close().await.unwrap();
     }
 }

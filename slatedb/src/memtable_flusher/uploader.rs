@@ -39,7 +39,7 @@ use tokio_util::sync::CancellationToken;
 
 /// One immutable-memtable upload request submitted to the uploader.
 pub(crate) struct UploadJob {
-    /// Ordering token assigned by the orchestrator.
+    /// Ordering token assigned by the memtable flusher.
     pub(crate) epoch: FlushEpoch,
     /// Immutable memtable to build into an SST.
     pub(crate) imm_memtable: Arc<ImmutableMemtable>,

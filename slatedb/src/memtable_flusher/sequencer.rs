@@ -41,7 +41,7 @@ use tokio::task::JoinHandle;
 /// Successful upload result handed off to the sequencer for ordered retirement.
 #[derive(Clone)]
 pub(crate) struct UploadedMemtable {
-    /// Ordering token assigned by the orchestrator.
+    /// Ordering token assigned by the memtable flusher.
     pub(crate) epoch: FlushEpoch,
     /// Same immutable memtable that was uploaded by the uploader.
     pub(crate) imm_memtable: Arc<ImmutableMemtable>,
@@ -308,8 +308,6 @@ impl SequencerTask {
         &mut self,
         commands: Vec<SequencerCommand>,
     ) -> Result<(), SlateDBError> {
-        let _ = &self.db;
-        let _ = &self.manifest;
         for command in commands {
             match command {
                 SequencerCommand::Uploaded(uploaded_memtable) => {
