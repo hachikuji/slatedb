@@ -23,7 +23,7 @@
 pub use crate::db_status::DbStatus;
 
 use std::ops::RangeBounds;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 use fail_parallel::FailPointRegistry;
@@ -61,7 +61,7 @@ use crate::iter::IterationOrder;
 use crate::manifest::store::FenceableManifest;
 use crate::manifest::{Manifest, ManifestCore};
 use crate::mem_table::WritableKVTable;
-use crate::mem_table_flush::{MemtableFlushMsg, MEMTABLE_FLUSHER_TASK_NAME};
+use crate::memtable_flusher::{FlushTarget, MemtableFlusher};
 use crate::oracle::{DbOracle, Oracle};
 use crate::paths::PathResolver;
 use crate::rand::DbRand;
@@ -87,7 +87,7 @@ pub(crate) struct DbInner {
     pub(crate) state: Arc<RwLock<DbState>>,
     pub(crate) settings: Settings,
     pub(crate) table_store: Arc<TableStore>,
-    pub(crate) memtable_flush_notifier: UnboundedSender<MemtableFlushMsg>,
+    pub(crate) memtable_flusher: OnceLock<Arc<MemtableFlusher>>,
     pub(crate) write_notifier: UnboundedSender<WriteBatchMessage>,
     pub(crate) db_stats: DbStats,
     pub(crate) stat_registry: Arc<StatRegistry>,
@@ -116,7 +116,6 @@ impl DbInner {
         rand: Arc<DbRand>,
         table_store: Arc<TableStore>,
         manifest: DirtyObject<Manifest>,
-        memtable_flush_notifier: UnboundedSender<MemtableFlushMsg>,
         write_notifier: UnboundedSender<WriteBatchMessage>,
         stat_registry: Arc<StatRegistry>,
         fp_registry: Arc<FailPointRegistry>,
@@ -152,12 +151,10 @@ impl DbInner {
             merge_operator,
         };
 
-        let recent_flushed_wal_id = state.read().state().core().replay_after_wal_id;
         let wal_buffer = Arc::new(WalBufferManager::new(
             state.clone(),
             state.clone(),
             db_stats.clone(),
-            recent_flushed_wal_id,
             oracle.clone(),
             table_store.clone(),
             mono_clock.clone(),
@@ -170,10 +167,10 @@ impl DbInner {
         let db_inner = Self {
             state,
             settings,
+            memtable_flusher: OnceLock::new(),
             oracle,
             wal_enabled,
             table_store,
-            memtable_flush_notifier,
             wal_buffer,
             write_notifier,
             db_stats,
@@ -404,33 +401,33 @@ impl DbInner {
         Ok(())
     }
 
-    pub(crate) async fn flush_wals(&self) -> Result<(), SlateDBError> {
-        self.wal_buffer.flush().await
+    pub(crate) async fn flush_wals(&self) -> Result<u64, SlateDBError> {
+        self.wal_buffer.flush().await?;
+        Ok(self.wal_buffer.recent_flushed_wal_id())
     }
 
     // use to manually flush memtables
     async fn flush_immutable_memtables(&self) -> Result<(), SlateDBError> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.memtable_flush_notifier.send_safely(
-            self.state.read().closed_result_reader(),
-            MemtableFlushMsg::FlushImmutableMemtables { sender: Some(tx) },
-        )?;
-        rx.await?
+        self.memtable_flusher()?
+            .flush(FlushTarget::BestEffort)
+            .await
+            .map(|_| ())
     }
 
-    pub(crate) async fn flush_memtables(&self) -> Result<(), SlateDBError> {
-        {
-            let last_flushed_wal_id = self.wal_buffer.recent_flushed_wal_id();
-            let mut guard = self.state.write();
-            if !guard.memtable().is_empty() {
-                guard.freeze_memtable(last_flushed_wal_id)?;
-                true
-            } else {
-                false
-            }
-        };
+    pub(crate) async fn flush_memtables(
+        &self,
+        through_wal_id: Option<u64>,
+    ) -> Result<(), SlateDBError> {
+        match self.prepare_memtable_flush_target(through_wal_id)? {
+            Some(guarantee) => self.memtable_flusher()?.flush(guarantee).await.map(|_| ()),
+            None => Ok(()),
+        }
+    }
 
-        self.flush_immutable_memtables().await
+    pub(crate) fn memtable_flusher(&self) -> Result<&Arc<MemtableFlusher>, SlateDBError> {
+        self.memtable_flusher
+            .get()
+            .ok_or(SlateDBError::InvalidDBState)
     }
 
     /// Flush in-memory writes to disk. See [`Db::flush`] for details.
@@ -493,12 +490,19 @@ impl DbInner {
         match options.flush_type {
             FlushType::Wal => {
                 if self.wal_enabled {
-                    self.flush_wals().await
+                    self.flush_wals().await.map(|_| ())
                 } else {
                     Err(SlateDBError::WalDisabled)
                 }
             }
-            FlushType::MemTable => self.flush_memtables().await,
+            FlushType::MemTable => {
+                let through_wal_id = if self.wal_enabled {
+                    Some(self.flush_wals().await?)
+                } else {
+                    None
+                };
+                self.flush_memtables(through_wal_id).await
+            }
         }
     }
 
@@ -584,6 +588,7 @@ impl DbInner {
 #[derive(Clone)]
 pub struct Db {
     pub(crate) inner: Arc<DbInner>,
+    memtable_flusher: Arc<MemtableFlusher>,
     task_executor: Arc<MessageHandlerExecutor>,
 }
 
@@ -695,6 +700,10 @@ impl Db {
             }
         }
 
+        if let Err(e) = self.memtable_flusher.close().await {
+            warn!("failed to shutdown memtable flusher [error={:?}]", e);
+        }
+
         if let Err(e) = self.task_executor.shutdown_task(COMPACTOR_TASK_NAME).await {
             warn!("failed to shutdown compactor task [error={:?}]", e);
         }
@@ -713,14 +722,6 @@ impl Db {
 
         if let Err(e) = self.task_executor.shutdown_task(WAL_BUFFER_TASK_NAME).await {
             warn!("failed to shutdown wal writer task [error={:?}]", e);
-        }
-
-        if let Err(e) = self
-            .task_executor
-            .shutdown_task(MEMTABLE_FLUSHER_TASK_NAME)
-            .await
-        {
-            warn!("failed to shutdown memtable writer task [error={:?}]", e);
         }
 
         info!("db closed");
@@ -4220,7 +4221,7 @@ mod tests {
 
         let flush_handle = {
             let inner = Arc::clone(&db.inner);
-            tokio::spawn(async move { inner.flush_memtables().await })
+            tokio::spawn(async move { inner.flush_memtables(None).await })
         };
 
         let mut froze_memtable = false;
@@ -5166,7 +5167,7 @@ mod tests {
         assert_eq!(db.inner.wal_buffer.recent_flushed_wal_id(), 2);
 
         // force a flush (even if the memtable is not full)
-        let flush_result = db.inner.flush_memtables().await;
+        let flush_result = db.inner.flush_memtables(None).await;
         assert!(flush_result.is_err());
         db.close().await.unwrap();
 
@@ -5879,7 +5880,7 @@ mod tests {
         fail_parallel::cfg(fp_registry.clone(), "write-compacted-sst-io-error", "off").unwrap();
 
         // Try to flush memtables, but they should fail due to the fence
-        let result = db1.inner.flush_memtables().await;
+        let result = db1.inner.flush_memtables(None).await;
         assert!(matches!(result, Err(SlateDBError::Fenced)));
         assert!(db1
             .inner
@@ -6084,7 +6085,7 @@ mod tests {
 
         // Test 1: Force memtable flush to update recent_snapshot_min_seq
         db.put(b"key1", b"value1").await.unwrap();
-        db.inner.flush_memtables().await.unwrap();
+        db.inner.flush_memtables(None).await.unwrap();
 
         {
             let state = db.inner.state.read();
@@ -6102,7 +6103,7 @@ mod tests {
 
         // Write more data and force flush
         db.put(b"key2", b"value2").await.unwrap();
-        db.inner.flush_memtables().await.unwrap();
+        db.inner.flush_memtables(None).await.unwrap();
 
         // Verify that txn_manager.min_active_seq() returns the snapshot seq
         let min_active_seq = db.inner.txn_manager.min_active_seq();
@@ -6125,7 +6126,7 @@ mod tests {
 
         // Write more data and flush to trigger update
         db.put(b"key3", b"value3").await.unwrap();
-        db.inner.flush_memtables().await.unwrap();
+        db.inner.flush_memtables(None).await.unwrap();
 
         // Now recent_snapshot_min_seq should be updated to higher value (no active snapshots)
         {

@@ -28,6 +28,7 @@ use crate::tablestore::TableStore;
 use crate::transaction_manager::TransactionManager;
 use crate::utils::IdGenerator;
 use crate::utils::{SendSafely, WatchableOnceCell};
+use log::debug;
 use parking_lot::Mutex;
 use slatedb_common::clock::SystemClock;
 use std::cmp;
@@ -285,7 +286,7 @@ impl SequencerTask {
     async fn run(mut self) -> Result<(), SlateDBError> {
         loop {
             let Some(command) = self.commands.recv().await else {
-                return Ok(());
+                return self.write_current_manifest_safely().await;
             };
 
             let commands = self.drain_ready_commands(command);
@@ -441,7 +442,12 @@ impl SequencerTask {
         }
 
         match self
-            .write_manifest_update_safely(attached_checkpoints.iter().map(|c| &c.options))
+            .write_manifest_update_safely(
+                &attached_checkpoints
+                    .iter()
+                    .map(|c| &c.options)
+                    .collect::<Vec<_>>(),
+            )
             .await
         {
             Ok(checkpoint_results) => {
@@ -467,6 +473,7 @@ impl SequencerTask {
         let mut guard = self.db.state.write();
         guard.modify(|modifier| {
             for uploaded in staged_batch {
+                let uploaded_tracker = uploaded.imm_memtable.sequence_tracker();
                 let popped = modifier
                     .state
                     .imm_memtable
@@ -506,18 +513,30 @@ impl SequencerTask {
                     .value
                     .core
                     .sequence_tracker
-                    .extend_from(uploaded.imm_memtable.sequence_tracker());
+                    .extend_from(uploaded_tracker);
+                let tracker = &modifier.state.manifest.value.core.sequence_tracker;
+                debug!(
+                    "sequencer applied uploaded state [epoch={}, last_seq={}, uploaded_tracker_len={}, manifest_tracker_len={}, manifest_tracker_first_seq={:?}, manifest_tracker_last_seq={:?}, manifest_tracker_first_ts={:?}, manifest_tracker_last_ts={:?}]",
+                    uploaded.epoch.0,
+                    uploaded.last_seq,
+                    uploaded_tracker.len(),
+                    tracker.len(),
+                    tracker.first_seq(),
+                    tracker.last_seq(),
+                    tracker.first_ts(),
+                    tracker.last_ts(),
+                );
             }
             Ok(())
         })
     }
 
-    async fn write_manifest_update_safely<'a>(
+    async fn write_manifest_update_safely(
         &mut self,
-        checkpoint_options: impl Iterator<Item = &'a CheckpointOptions> + Clone,
+        checkpoint_options: &[&CheckpointOptions],
     ) -> Result<Vec<CheckpointCreateResult>, SlateDBError> {
         loop {
-            let result = self.write_manifest_update(checkpoint_options.clone()).await;
+            let result = self.write_manifest_update(checkpoint_options).await;
             if matches!(result, Err(SlateDBError::TransactionalObjectVersionExists)) {
                 self.load_manifest().await?;
             } else {
@@ -526,18 +545,15 @@ impl SequencerTask {
         }
     }
 
-    async fn write_manifest_update<'a>(
+    async fn write_manifest_update(
         &mut self,
-        checkpoint_options: impl Iterator<Item = &'a CheckpointOptions>,
+        checkpoint_options: &[&CheckpointOptions],
     ) -> Result<Vec<CheckpointCreateResult>, SlateDBError> {
-        let mut dirty = {
-            let rguard_state = self.db.state.read();
-            rguard_state.state().manifest.clone()
-        };
+        let mut dirty = self.clone_local_manifest_for_write("manifest update");
         let mut checkpoint_results = Vec::new();
         for options in checkpoint_options {
             let id = self.db.rand.rng().gen_uuid();
-            let checkpoint = self.manifest.new_checkpoint(id, options)?;
+            let checkpoint = self.manifest.new_checkpoint(id, *options)?;
             let manifest_id = checkpoint.manifest_id;
             dirty.value.core.checkpoints.push(checkpoint);
             checkpoint_results.push(CheckpointCreateResult { id, manifest_id });
@@ -546,10 +562,74 @@ impl SequencerTask {
         Ok(checkpoint_results)
     }
 
+    async fn write_current_manifest_safely(&mut self) -> Result<(), SlateDBError> {
+        loop {
+            let result = self.write_current_manifest().await;
+            if matches!(result, Err(SlateDBError::TransactionalObjectVersionExists)) {
+                self.load_manifest().await?;
+            } else {
+                return result;
+            }
+        }
+    }
+
+    async fn write_current_manifest(&mut self) -> Result<(), SlateDBError> {
+        let dirty = self.clone_local_manifest_for_write("current manifest");
+        self.manifest.update(dirty).await
+    }
+
+    fn clone_local_manifest_for_write(
+        &self,
+        reason: &str,
+    ) -> slatedb_txn_obj::DirtyObject<crate::manifest::Manifest> {
+        let dirty = {
+            let rguard_state = self.db.state.read();
+            rguard_state.state().manifest.clone()
+        };
+        debug!(
+            "sequencer writing {} [l0_len={}, last_l0_seq={}, replay_after_wal_id={}, tracker_len={}, tracker_first_seq={:?}, tracker_last_seq={:?}, tracker_first_ts={:?}, tracker_last_ts={:?}]",
+            reason,
+            dirty.value.core.l0.len(),
+            dirty.value.core.last_l0_seq,
+            dirty.value.core.replay_after_wal_id,
+            dirty.value.core.sequence_tracker.len(),
+            dirty.value.core.sequence_tracker.first_seq(),
+            dirty.value.core.sequence_tracker.last_seq(),
+            dirty.value.core.sequence_tracker.first_ts(),
+            dirty.value.core.sequence_tracker.last_ts(),
+        );
+        dirty
+    }
+
     async fn load_manifest(&mut self) -> Result<(), SlateDBError> {
         self.manifest.refresh().await?;
+        let remote_dirty = self.manifest.prepare_dirty()?;
+        debug!(
+            "sequencer loading manifest [remote_l0_len={}, remote_last_l0_seq={}, remote_replay_after_wal_id={}, remote_tracker_len={}, remote_tracker_first_seq={:?}, remote_tracker_last_seq={:?}, remote_tracker_first_ts={:?}, remote_tracker_last_ts={:?}]",
+            remote_dirty.value.core.l0.len(),
+            remote_dirty.value.core.last_l0_seq,
+            remote_dirty.value.core.replay_after_wal_id,
+            remote_dirty.value.core.sequence_tracker.len(),
+            remote_dirty.value.core.sequence_tracker.first_seq(),
+            remote_dirty.value.core.sequence_tracker.last_seq(),
+            remote_dirty.value.core.sequence_tracker.first_ts(),
+            remote_dirty.value.core.sequence_tracker.last_ts(),
+        );
         let mut wguard_state = self.db.state.write();
-        wguard_state.merge_remote_manifest(self.manifest.prepare_dirty()?);
+        wguard_state.merge_remote_manifest(remote_dirty);
+        let merged_state = wguard_state.state();
+        let merged = merged_state.core();
+        debug!(
+            "sequencer merged manifest [merged_l0_len={}, merged_last_l0_seq={}, merged_replay_after_wal_id={}, merged_tracker_len={}, merged_tracker_first_seq={:?}, merged_tracker_last_seq={:?}, merged_tracker_first_ts={:?}, merged_tracker_last_ts={:?}]",
+            merged.l0.len(),
+            merged.last_l0_seq,
+            merged.replay_after_wal_id,
+            merged.sequence_tracker.len(),
+            merged.sequence_tracker.first_seq(),
+            merged.sequence_tracker.last_seq(),
+            merged.sequence_tracker.first_ts(),
+            merged.sequence_tracker.last_ts(),
+        );
         self.db
             .db_stats
             .l0_sst_count
@@ -561,30 +641,11 @@ impl SequencerTask {
         &mut self,
         options: &CheckpointOptions,
     ) -> Result<CheckpointCreateResult, SlateDBError> {
-        loop {
-            self.load_manifest().await?;
-            let result = self.write_checkpoint(options).await;
-            if matches!(result, Err(SlateDBError::TransactionalObjectVersionExists)) {
-                continue;
-            }
-            return result;
-        }
-    }
-
-    async fn write_checkpoint(
-        &mut self,
-        options: &CheckpointOptions,
-    ) -> Result<CheckpointCreateResult, SlateDBError> {
-        let mut dirty = {
-            let rguard_state = self.db.state.read();
-            rguard_state.state().manifest.clone()
-        };
-        let id = self.db.rand.rng().gen_uuid();
-        let checkpoint = self.manifest.new_checkpoint(id, options)?;
-        let manifest_id = checkpoint.manifest_id;
-        dirty.value.core.checkpoints.push(checkpoint);
-        self.manifest.update(dirty).await?;
-        Ok(CheckpointCreateResult { id, manifest_id })
+        self.load_manifest().await?;
+        let mut results = self.write_manifest_update_safely(&[options]).await?;
+        Ok(results
+            .pop()
+            .expect("checkpoint write should return exactly one result"))
     }
 
     async fn finish_ready_batch(
@@ -730,7 +791,6 @@ mod tests {
             Arc::clone(&fp_registry),
             None,
         ));
-        let (memtable_flush_tx, _) = mpsc::unbounded_channel();
         let (write_tx, _) = mpsc::unbounded_channel();
         let inner = Arc::new(
             DbInner::new(
@@ -739,7 +799,6 @@ mod tests {
                 Arc::clone(&rand),
                 Arc::clone(&table_store),
                 manifest_dirty,
-                memtable_flush_tx,
                 write_tx,
                 Arc::clone(&stat_registry),
                 fp_registry,

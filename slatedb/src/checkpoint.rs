@@ -1,8 +1,6 @@
 use crate::config::{CheckpointOptions, CheckpointScope};
 use crate::db::Db;
-use crate::error::SlateDBError;
-use crate::mem_table_flush::MemtableFlushMsg;
-use crate::utils::SendSafely;
+use crate::memtable_flusher::FlushTarget;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;
@@ -34,25 +32,24 @@ impl Db {
         scope: CheckpointScope,
         options: &CheckpointOptions,
     ) -> Result<CheckpointCreateResult, crate::Error> {
-        // flush all the data into SSTs
-        if let CheckpointScope::All = scope {
-            if self.inner.wal_enabled {
-                self.inner.flush_wals().await?;
+        let guarantee = match scope {
+            CheckpointScope::All => {
+                let through_wal_id = if self.inner.wal_enabled {
+                    Some(self.inner.flush_wals().await?)
+                } else {
+                    None
+                };
+                self.inner
+                    .prepare_memtable_flush_target(through_wal_id)?
+                    .unwrap_or(FlushTarget::CurrentDurable)
             }
-            self.inner.flush_memtables().await?;
-        }
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.inner.memtable_flush_notifier.send_safely(
-            self.inner.state.read().closed_result_reader(),
-            MemtableFlushMsg::CreateCheckpoint {
-                options: options.clone(),
-                sender: tx,
-            },
-        )?;
-
-        let result = rx.await.map_err(SlateDBError::ReadChannelError)?;
-        result.map_err(Into::into)
+            CheckpointScope::Durable => FlushTarget::CurrentDurable,
+        };
+        self.inner
+            .memtable_flusher()?
+            .create_checkpoint(guarantee, options.clone())
+            .await
+            .map_err(Into::into)
     }
 }
 
@@ -326,6 +323,50 @@ mod tests {
         };
         test_checkpoint_scope_all(db_options, |manifest| manifest.core.l0.front().unwrap().id)
             .await;
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_scope_all_flushes_current_memtable_into_latest_manifest() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_checkpoint_scope_all_flushes_current_memtable");
+        let db = Db::builder(path.clone(), object_store.clone())
+            .with_settings(Settings {
+                flush_interval: Some(Duration::from_millis(5000)),
+                ..Settings::default()
+            })
+            .build()
+            .await
+            .unwrap();
+
+        db.put(b"k1", b"v1").await.unwrap();
+        db.put(b"k2", b"v2").await.unwrap();
+
+        let checkpoint = db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+
+        let manifest_store = ManifestStore::new(&path, object_store.clone());
+        let (latest_manifest_id, latest_manifest) =
+            manifest_store.read_latest_manifest().await.unwrap();
+
+        assert_eq!(latest_manifest_id, checkpoint.manifest_id);
+        assert_eq!(latest_manifest.core.l0.len(), 1);
+        assert!(
+            latest_manifest.core.last_l0_seq >= 2,
+            "expected checkpoint flush to advance last_l0_seq, got {}",
+            latest_manifest.core.last_l0_seq
+        );
+
+        assert_flushed_entry(
+            Arc::clone(&object_store),
+            path,
+            &latest_manifest.core.l0.front().unwrap().id,
+            (&Bytes::from_static(b"k2"), &Bytes::from_static(b"v2")),
+        )
+        .await;
+
+        db.close().await.unwrap();
     }
 
     #[tokio::test]

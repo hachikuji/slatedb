@@ -3,9 +3,8 @@ use parking_lot::RwLockWriteGuard;
 use crate::db::DbInner;
 use crate::db_state::DbState;
 use crate::error::SlateDBError;
-use crate::mem_table_flush::MemtableFlushMsg;
+use crate::memtable_flusher::FlushTarget;
 use crate::oracle::Oracle;
-use crate::utils::SendSafely;
 use crate::wal_replay::ReplayedMemtable;
 
 pub(crate) const MAX_WAL_FLUSHES_BEFORE_L0_FLUSH: u64 = 4096;
@@ -48,11 +47,45 @@ impl DbInner {
         }
 
         guard.freeze_memtable(wal_id)?;
-        self.memtable_flush_notifier.send_safely(
-            guard.closed_result_reader(),
-            MemtableFlushMsg::FlushImmutableMemtables { sender: None },
-        )?;
+        if let Ok(memtable_flusher) = self.memtable_flusher() {
+            // Best-effort scheduling should not break startup recovery or shutdown.
+            let _ = memtable_flusher.schedule_flush(FlushTarget::BestEffort);
+        }
         Ok(())
+    }
+
+    pub(crate) fn prepare_memtable_flush_target(
+        &self,
+        through_wal_id: Option<u64>,
+    ) -> Result<Option<FlushTarget>, SlateDBError> {
+        {
+            let mut guard = self.state.write();
+            if !guard.memtable().is_empty() {
+                let wal_id = if self.wal_enabled {
+                    through_wal_id.unwrap_or(self.wal_buffer.recent_flushed_wal_id())
+                } else {
+                    0
+                };
+                self.freeze_memtable(&mut guard, wal_id)?;
+            }
+        }
+
+        let has_imm = {
+            let guard = self.state.read();
+            !guard.state().imm_memtable.is_empty()
+        };
+
+        if !has_imm {
+            return Ok(None);
+        }
+
+        Ok(Some(if self.wal_enabled {
+            FlushTarget::ThroughWalId(
+                through_wal_id.unwrap_or(self.wal_buffer.recent_flushed_wal_id()),
+            )
+        } else {
+            FlushTarget::ThroughCurrentImm
+        }))
     }
 
     pub(crate) fn replay_memtable(

@@ -146,8 +146,7 @@ use crate::format::sst::{BlockTransformer, SsTableFormat};
 use crate::garbage_collector::GarbageCollector;
 use crate::garbage_collector::GC_TASK_NAME;
 use crate::manifest::store::{FenceableManifest, ManifestStore, StoredManifest};
-use crate::mem_table_flush::MemtableFlusher;
-use crate::mem_table_flush::MEMTABLE_FLUSHER_TASK_NAME;
+use crate::memtable_flusher::{sequencer::Sequencer, uploader::Uploader, MemtableFlusher};
 use crate::merge_operator::MergeOperatorType;
 use crate::object_stores::ObjectStores;
 use crate::paths::PathResolver;
@@ -475,7 +474,6 @@ impl<P: Into<Path>> DbBuilder<P> {
         .await?;
 
         // Setup communication channels
-        let (memtable_flush_tx, memtable_flush_rx) = tokio::sync::mpsc::unbounded_channel();
         let (write_tx, write_rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Create the database inner state
@@ -488,7 +486,6 @@ impl<P: Into<Path>> DbBuilder<P> {
                 rand.clone(),
                 table_store.clone(),
                 manifest.prepare_dirty()?,
-                memtable_flush_tx,
                 write_tx,
                 stat_registry,
                 self.fp_registry.clone(),
@@ -512,18 +509,11 @@ impl<P: Into<Path>> DbBuilder<P> {
             inner.wal_buffer.init(task_executor.clone()).await?;
         };
         task_executor.add_handler(
-            MEMTABLE_FLUSHER_TASK_NAME.to_string(),
-            Box::new(MemtableFlusher::new(inner.clone(), manifest)),
-            memtable_flush_rx,
-            &tokio_handle,
-        )?;
-        task_executor.add_handler(
             WRITE_BATCH_TASK_NAME.to_string(),
             Box::new(WriteBatchEventHandler::new(inner.clone())),
             write_rx,
             &tokio_handle,
         )?;
-
         // Not to pollute the cache during compaction or GC
         let uncached_table_store = Arc::new(TableStore::new_with_fp_registry(
             ObjectStores::new(
@@ -593,6 +583,41 @@ impl<P: Into<Path>> DbBuilder<P> {
         // Replay WAL
         inner.replay_wal().await?;
 
+        if inner.wal_enabled {
+            let recent_flushed_wal_id = {
+                let guard = inner.state.read();
+                guard
+                    .state()
+                    .imm_memtable
+                    .front()
+                    .map(|imm| imm.recent_flushed_wal_id())
+                    .unwrap_or(guard.state().core().replay_after_wal_id)
+            };
+            inner
+                .wal_buffer
+                .set_recent_flushed_wal_id(recent_flushed_wal_id);
+        };
+
+        let manifest_reader =
+            StoredManifest::load(manifest_store.clone(), system_clock.clone()).await?;
+        let memtable_flusher = Arc::new(MemtableFlusher::start(
+            inner.clone(),
+            Some(manifest_reader),
+            Uploader::start(
+                crate::memtable_flusher::uploader::UploaderDb::from_db_inner(&inner),
+                1,
+                self.settings.manifest_poll_interval,
+                &tokio_handle,
+            ),
+            Sequencer::start(
+                crate::memtable_flusher::sequencer::SequencerDb::from_db_inner(&inner),
+                manifest,
+                &tokio_handle,
+            ),
+            &tokio_handle,
+        ));
+        let _ = inner.memtable_flusher.set(memtable_flusher.clone());
+
         // Preload cache if enabled
         if let Some(cached_obj_store) = cached_object_store {
             inner
@@ -603,6 +628,7 @@ impl<P: Into<Path>> DbBuilder<P> {
         // Create and return the Db instance
         Ok(Db {
             inner,
+            memtable_flusher,
             task_executor,
         })
     }

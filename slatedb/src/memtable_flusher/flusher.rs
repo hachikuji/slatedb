@@ -14,7 +14,7 @@
 //! - manifest durability sequencing
 
 use crate::checkpoint::CheckpointCreateResult;
-use crate::config::{CheckpointOptions, CheckpointScope};
+use crate::config::CheckpointOptions;
 use crate::db::DbInner;
 use crate::error::SlateDBError;
 use crate::manifest::store::StoredManifest;
@@ -22,6 +22,8 @@ use crate::memtable_flusher::sequencer::{Sequencer, SequencerEvent, UploadedMemt
 use crate::memtable_flusher::uploader::{UploadJob, Uploader, UploaderEvent};
 use crate::oracle::Oracle;
 use crate::utils::{IdGenerator, SendSafely, WatchableOnceCell};
+use fail_parallel::fail_point;
+use log::debug;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -34,11 +36,15 @@ use tokio::time;
 use super::FlushEpoch;
 
 /// Flush request guarantee exposed by the memtable flusher.
-pub(crate) enum FlushGuarantee {
+pub(crate) enum FlushTarget {
     /// Attempt to make progress without waiting for a specific durability frontier.
     BestEffort,
+    /// Operate against the currently durable frontier without requiring new flush work.
+    CurrentDurable,
     /// Wait until all immutable memtables through the captured WAL frontier are durable.
     ThroughWalId(u64),
+    /// Wait until the currently observed immutable memtable frontier is durable.
+    ThroughCurrentImm,
 }
 
 /// Result reported for a completed flush request.
@@ -74,19 +80,19 @@ impl MemtableFlusherDb {
 
 /// Parallel L0 memtable flusher subsystem.
 pub(crate) struct MemtableFlusher {
-    commands: Option<OrchestratorCommandSender>,
+    commands: Mutex<Option<OrchestratorCommandSender>>,
     poisoned: Arc<Mutex<Option<SlateDBError>>>,
     closed_result: WatchableOnceCell<Result<(), SlateDBError>>,
-    task: Option<JoinHandle<Result<(), SlateDBError>>>,
+    task: Mutex<Option<JoinHandle<Result<(), SlateDBError>>>>,
 }
 
 enum OrchestratorCommand {
     Flush {
-        guarantee: FlushGuarantee,
-        sender: oneshot::Sender<Result<FlushResult, SlateDBError>>,
+        guarantee: FlushTarget,
+        sender: Option<oneshot::Sender<Result<FlushResult, SlateDBError>>>,
     },
     CreateCheckpoint {
-        scope: CheckpointScope,
+        guarantee: FlushTarget,
         options: CheckpointOptions,
         sender: oneshot::Sender<Result<CheckpointCreateResult, SlateDBError>>,
     },
@@ -134,39 +140,64 @@ impl MemtableFlusher {
         );
 
         Self {
-            commands: Some(commands_tx),
+            commands: Mutex::new(Some(commands_tx)),
             poisoned,
             closed_result,
-            task: Some(task),
+            task: Mutex::new(Some(task)),
         }
     }
 
     /// Processes one flush request using the requested guarantee.
-    pub(crate) async fn flush(
-        &self,
-        guarantee: FlushGuarantee,
-    ) -> Result<FlushResult, SlateDBError> {
+    pub(crate) async fn flush(&self, guarantee: FlushTarget) -> Result<FlushResult, SlateDBError> {
         if let Some(err) = self.poisoned.lock().clone() {
             return Err(err);
         }
         let (tx, rx) = oneshot::channel();
         self.commands
+            .lock()
             .as_ref()
             .ok_or(SlateDBError::Closed)?
             .send_safely(
                 self.closed_result.reader(),
                 OrchestratorCommand::Flush {
                     guarantee,
-                    sender: tx,
+                    sender: Some(tx),
                 },
             )?;
         rx.await.map_err(SlateDBError::ReadChannelError)?
     }
 
+    /// Schedules a flush request without awaiting its result.
+    pub(crate) fn schedule_flush(&self, guarantee: FlushTarget) -> Result<(), SlateDBError> {
+        if let Some(err) = self.poisoned.lock().clone() {
+            return Err(err);
+        }
+        let Some(commands) = self.commands.lock().as_ref().cloned() else {
+            return Err(SlateDBError::Closed);
+        };
+        #[allow(clippy::disallowed_methods)]
+        match commands.send(OrchestratorCommand::Flush {
+            guarantee,
+            sender: None,
+        }) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                if let Some(result) = self.closed_result.reader().read() {
+                    match result {
+                        Ok(()) => Err(SlateDBError::Closed),
+                        Err(err) => Err(err),
+                    }
+                } else {
+                    Err(SlateDBError::Closed)
+                }
+            }
+        }
+    }
+
     /// Creates a checkpoint using the memtable flusher's flush semantics.
     pub(crate) async fn create_checkpoint(
         &self,
-        scope: CheckpointScope,
+        guarantee: FlushTarget,
         options: CheckpointOptions,
     ) -> Result<CheckpointCreateResult, SlateDBError> {
         if let Some(err) = self.poisoned.lock().clone() {
@@ -174,12 +205,13 @@ impl MemtableFlusher {
         }
         let (tx, rx) = oneshot::channel();
         self.commands
+            .lock()
             .as_ref()
             .ok_or(SlateDBError::Closed)?
             .send_safely(
                 self.closed_result.reader(),
                 OrchestratorCommand::CreateCheckpoint {
-                    scope,
+                    guarantee,
                     options,
                     sender: tx,
                 },
@@ -187,18 +219,18 @@ impl MemtableFlusher {
         rx.await.map_err(SlateDBError::ReadChannelError)?
     }
 
-    /// Closes the orchestrator and any owned subsystems.
-    pub(crate) async fn close(&mut self) -> Result<(), SlateDBError> {
-        self.commands.take();
-        let result = if let Some(task) = self.task.take() {
+    /// Closes the flusher and any owned subsystems.
+    pub(crate) async fn close(&self) -> Result<(), SlateDBError> {
+        self.commands.lock().take();
+        let result = if let Some(task) = self.task.lock().take() {
             match task.await {
                 Ok(result) => result,
                 Err(join_err) if join_err.is_cancelled() => Ok(()),
-                Err(join_err) if join_err.is_panic() => Err(SlateDBError::BackgroundTaskPanic(
-                    "parallel_l0_flush_orchestrator".into(),
-                )),
+                Err(join_err) if join_err.is_panic() => {
+                    Err(SlateDBError::BackgroundTaskPanic("memtable_flusher".into()))
+                }
                 Err(_) => Err(SlateDBError::BackgroundTaskCancelled(
-                    "parallel_l0_flush_orchestrator".into(),
+                    "memtable_flusher".into(),
                 )),
             }
         } else {
@@ -285,17 +317,23 @@ impl OrchestratorTask {
     async fn handle_command(&mut self, command: OrchestratorCommand) -> Result<(), SlateDBError> {
         match command {
             OrchestratorCommand::Flush { guarantee, sender } => {
+                fail_point!(
+                    Arc::clone(&self.db.inner.fp_registry),
+                    "flush-memtable-to-l0"
+                );
                 self.register_new_imm_memtables();
                 let result = self.handle_flush_request(guarantee, sender).await;
                 self.reconcile_and_dispatch().await?;
                 result
             }
             OrchestratorCommand::CreateCheckpoint {
-                scope,
+                guarantee,
                 options,
                 sender,
             } => {
-                let result = self.handle_checkpoint_request(scope, options, sender).await;
+                let result = self
+                    .handle_checkpoint_request(guarantee, options, sender)
+                    .await;
                 self.reconcile_and_dispatch().await?;
                 result
             }
@@ -304,27 +342,66 @@ impl OrchestratorTask {
 
     async fn handle_flush_request(
         &mut self,
-        guarantee: FlushGuarantee,
-        sender: oneshot::Sender<Result<FlushResult, SlateDBError>>,
+        guarantee: FlushTarget,
+        sender: Option<oneshot::Sender<Result<FlushResult, SlateDBError>>>,
     ) -> Result<(), SlateDBError> {
         match guarantee {
-            FlushGuarantee::BestEffort => {
-                let _ = sender.send(Ok(self.flush_result()));
+            FlushTarget::BestEffort => {
+                if let Some(sender) = sender {
+                    let _ = sender.send(Ok(self.flush_result()));
+                }
                 Ok(())
             }
-            FlushGuarantee::ThroughWalId(required_wal_id) => {
+            FlushTarget::CurrentDurable => {
+                if let Some(sender) = sender {
+                    let _ = sender.send(Ok(self.flush_result()));
+                }
+                Ok(())
+            }
+            FlushTarget::ThroughWalId(required_wal_id) => {
                 if self
                     .durable_state
                     .wal_id
                     .is_some_and(|durable_wal_id| durable_wal_id >= required_wal_id)
                 {
-                    let _ = sender.send(Ok(self.flush_result()));
+                    if let Some(sender) = sender {
+                        let _ = sender.send(Ok(self.flush_result()));
+                    }
                     return Ok(());
                 }
-                self.pending_flushes.push(PendingFlush {
-                    required_wal_id,
-                    sender,
-                });
+                if let Some(sender) = sender {
+                    self.pending_flushes.push(PendingFlush {
+                        requirement: FlushRequirement::WalId(required_wal_id),
+                        sender,
+                    });
+                }
+                Ok(())
+            }
+            FlushTarget::ThroughCurrentImm => {
+                self.register_new_imm_memtables();
+                let Some(required_epoch) = self.tracked_imms.back().map(|tracked| tracked.epoch)
+                else {
+                    if let Some(sender) = sender {
+                        let _ = sender.send(Ok(self.flush_result()));
+                    }
+                    return Ok(());
+                };
+                if self
+                    .durable_state
+                    .epoch
+                    .is_some_and(|durable_epoch| durable_epoch >= required_epoch)
+                {
+                    if let Some(sender) = sender {
+                        let _ = sender.send(Ok(self.flush_result()));
+                    }
+                    return Ok(());
+                }
+                if let Some(sender) = sender {
+                    self.pending_flushes.push(PendingFlush {
+                        requirement: FlushRequirement::Epoch(required_epoch),
+                        sender,
+                    });
+                }
                 Ok(())
             }
         }
@@ -332,40 +409,58 @@ impl OrchestratorTask {
 
     async fn handle_checkpoint_request(
         &mut self,
-        scope: CheckpointScope,
+        guarantee: FlushTarget,
         options: CheckpointOptions,
         sender: oneshot::Sender<Result<CheckpointCreateResult, SlateDBError>>,
     ) -> Result<(), SlateDBError> {
-        match scope {
-            CheckpointScope::Durable => {
+        match guarantee {
+            FlushTarget::BestEffort => {
                 let result = self.sequencer.create_checkpoint(None, options).await;
                 let _ = sender.send(result);
                 Ok(())
             }
-            CheckpointScope::All => {
-                if self.db.inner.wal_enabled
-                    && self
-                        .db
-                        .inner
-                        .wal_buffer
-                        .watcher_for_oldest_unflushed_wal()
-                        .is_some()
-                {
-                    self.db.inner.flush_wals().await?;
-                }
+            FlushTarget::CurrentDurable => {
+                let result = self.sequencer.create_checkpoint(None, options).await;
+                let _ = sender.send(result);
+                Ok(())
+            }
+            FlushTarget::ThroughWalId(required_wal_id) => {
                 self.register_new_imm_memtables();
-                let required_wal_id = self.tracked_imms.back().map(|tracked| tracked.wal_id);
-                if required_wal_id.is_none_or(|required| {
-                    self.durable_state
-                        .wal_id
-                        .is_some_and(|durable| durable >= required)
-                }) {
+                if self
+                    .durable_state
+                    .wal_id
+                    .is_some_and(|durable| durable >= required_wal_id)
+                {
                     let result = self.sequencer.create_checkpoint(None, options).await;
                     let _ = sender.send(result);
                     return Ok(());
                 }
                 self.pending_checkpoints.push(PendingCheckpoint {
-                    required_wal_id: required_wal_id.expect("checked above"),
+                    requirement: FlushRequirement::WalId(required_wal_id),
+                    options,
+                    sender,
+                });
+                Ok(())
+            }
+            FlushTarget::ThroughCurrentImm => {
+                self.register_new_imm_memtables();
+                let Some(required_epoch) = self.tracked_imms.back().map(|tracked| tracked.epoch)
+                else {
+                    let result = self.sequencer.create_checkpoint(None, options).await;
+                    let _ = sender.send(result);
+                    return Ok(());
+                };
+                if self
+                    .durable_state
+                    .epoch
+                    .is_some_and(|durable_epoch| durable_epoch >= required_epoch)
+                {
+                    let result = self.sequencer.create_checkpoint(None, options).await;
+                    let _ = sender.send(result);
+                    return Ok(());
+                }
+                self.pending_checkpoints.push(PendingCheckpoint {
+                    requirement: FlushRequirement::Epoch(required_epoch),
                     options,
                     sender,
                 });
@@ -439,7 +534,39 @@ impl OrchestratorTask {
         if let Some(manifest_reader) = &self.db.manifest_reader {
             let mut manifest_reader = manifest_reader.lock().await;
             manifest_reader.refresh().await?;
+            let remote_dirty = manifest_reader.prepare_dirty()?;
+            debug!(
+                "flusher refreshing manifest progress [remote_l0_len={}, remote_last_l0_seq={}, remote_replay_after_wal_id={}, remote_tracker_len={}, remote_tracker_first_seq={:?}, remote_tracker_last_seq={:?}, remote_tracker_first_ts={:?}, remote_tracker_last_ts={:?}]",
+                remote_dirty.value.core.l0.len(),
+                remote_dirty.value.core.last_l0_seq,
+                remote_dirty.value.core.replay_after_wal_id,
+                remote_dirty.value.core.sequence_tracker.len(),
+                remote_dirty.value.core.sequence_tracker.first_seq(),
+                remote_dirty.value.core.sequence_tracker.last_seq(),
+                remote_dirty.value.core.sequence_tracker.first_ts(),
+                remote_dirty.value.core.sequence_tracker.last_ts(),
+            );
             self.durable_l0_len = manifest_reader.db_state().l0.len();
+            let mut wguard_state = self.db.inner.state.write();
+            wguard_state.merge_remote_manifest(remote_dirty);
+            let merged_state = wguard_state.state();
+            let merged = merged_state.core();
+            debug!(
+                "flusher merged manifest progress [merged_l0_len={}, merged_last_l0_seq={}, merged_replay_after_wal_id={}, merged_tracker_len={}, merged_tracker_first_seq={:?}, merged_tracker_last_seq={:?}, merged_tracker_first_ts={:?}, merged_tracker_last_ts={:?}]",
+                merged.l0.len(),
+                merged.last_l0_seq,
+                merged.replay_after_wal_id,
+                merged.sequence_tracker.len(),
+                merged.sequence_tracker.first_seq(),
+                merged.sequence_tracker.last_seq(),
+                merged.sequence_tracker.first_ts(),
+                merged.sequence_tracker.last_ts(),
+            );
+            self.db
+                .inner
+                .db_stats
+                .l0_sst_count
+                .set(wguard_state.state().core().l0.len() as i64);
         } else {
             self.durable_l0_len = self.db.inner.state.read().state().core().l0.len();
         }
@@ -514,13 +641,10 @@ impl OrchestratorTask {
 
     fn resolve_flush_waiters(&mut self) {
         let flush_result = self.flush_result();
-        let mut pending = Vec::with_capacity(self.pending_flushes.len());
-        for flush in self.pending_flushes.drain(..) {
-            if self
-                .durable_state
-                .wal_id
-                .is_some_and(|durable_wal_id| durable_wal_id >= flush.required_wal_id)
-            {
+        let pending_flushes = std::mem::take(&mut self.pending_flushes);
+        let mut pending = Vec::with_capacity(pending_flushes.len());
+        for flush in pending_flushes {
+            if self.requirement_satisfied(flush.requirement) {
                 let _ = flush.sender.send(Ok(FlushResult {
                     durable_through_wal_id: flush_result.durable_through_wal_id,
                     durable_through_seq: flush_result.durable_through_seq,
@@ -533,13 +657,10 @@ impl OrchestratorTask {
     }
 
     async fn resolve_checkpoint_waiters(&mut self) -> Result<(), SlateDBError> {
-        let mut pending = Vec::with_capacity(self.pending_checkpoints.len());
-        for checkpoint in self.pending_checkpoints.drain(..) {
-            if self
-                .durable_state
-                .wal_id
-                .is_some_and(|durable_wal_id| durable_wal_id >= checkpoint.required_wal_id)
-            {
+        let pending_checkpoints = std::mem::take(&mut self.pending_checkpoints);
+        let mut pending = Vec::with_capacity(pending_checkpoints.len());
+        for checkpoint in pending_checkpoints {
+            if self.requirement_satisfied(checkpoint.requirement) {
                 let result = self
                     .sequencer
                     .create_checkpoint(None, checkpoint.options)
@@ -551,6 +672,19 @@ impl OrchestratorTask {
         }
         self.pending_checkpoints = pending;
         Ok(())
+    }
+
+    fn requirement_satisfied(&self, requirement: FlushRequirement) -> bool {
+        match requirement {
+            FlushRequirement::WalId(required_wal_id) => self
+                .durable_state
+                .wal_id
+                .is_some_and(|durable_wal_id| durable_wal_id >= required_wal_id),
+            FlushRequirement::Epoch(required_epoch) => self
+                .durable_state
+                .epoch
+                .is_some_and(|durable_epoch| durable_epoch >= required_epoch),
+        }
     }
 
     fn flush_result(&self) -> FlushResult {
@@ -597,20 +731,26 @@ enum TrackedImmState {
 }
 
 struct PendingFlush {
-    required_wal_id: u64,
+    requirement: FlushRequirement,
     sender: oneshot::Sender<Result<FlushResult, SlateDBError>>,
 }
 
 struct PendingCheckpoint {
-    required_wal_id: u64,
+    requirement: FlushRequirement,
     options: CheckpointOptions,
     sender: oneshot::Sender<Result<CheckpointCreateResult, SlateDBError>>,
 }
 
+#[derive(Clone, Copy)]
+enum FlushRequirement {
+    WalId(u64),
+    Epoch(FlushEpoch),
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FlushGuarantee, MemtableFlusher, MemtableFlusherDb};
-    use crate::config::{CheckpointOptions, CheckpointScope, Settings};
+    use super::{FlushTarget, MemtableFlusher, MemtableFlusherDb};
+    use crate::config::{CheckpointOptions, Settings};
     use crate::db::DbInner;
     use crate::db_state::{ManifestCore, SsTableHandle, SsTableId, SsTableInfo, SstType};
     use crate::error::SlateDBError;
@@ -673,7 +813,6 @@ mod tests {
             Arc::clone(&fp_registry),
             None,
         ));
-        let (memtable_flush_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let (write_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let inner = Arc::new(
             DbInner::new(
@@ -682,7 +821,6 @@ mod tests {
                 Arc::clone(&rand),
                 Arc::clone(&table_store),
                 stored_manifest.prepare_dirty().unwrap(),
-                memtable_flush_tx,
                 write_tx,
                 Arc::clone(&stat_registry),
                 fp_registry,
@@ -858,7 +996,7 @@ mod tests {
 
         let result = timeout(
             Duration::from_secs(5),
-            orchestrator.flush(FlushGuarantee::BestEffort),
+            orchestrator.flush(FlushTarget::BestEffort),
         )
         .await
         .unwrap()
@@ -883,7 +1021,7 @@ mod tests {
 
         let result = timeout(
             Duration::from_secs(5),
-            orchestrator.flush(FlushGuarantee::ThroughWalId(11)),
+            orchestrator.flush(FlushTarget::ThroughWalId(11)),
         )
         .await
         .unwrap()
@@ -891,6 +1029,32 @@ mod tests {
 
         assert_eq!(result.durable_through_wal_id, Some(11));
         assert_eq!(result.durable_through_seq, Some(1));
+
+        orchestrator.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn through_current_imm_waits_for_durable_upload() {
+        let harness = setup_harness(
+            "/tmp/test_parallel_l0_flush_orchestrator_through_current_imm",
+            Settings::default(),
+            Arc::new(FailPointRegistry::new()),
+        )
+        .await;
+        freeze_value_imm(&harness, b"k1", b"v1", 1, 0);
+        freeze_value_imm(&harness, b"k2", b"v2", 2, 0);
+        let mut orchestrator = start_orchestrator(harness);
+
+        let result = timeout(
+            Duration::from_secs(5),
+            orchestrator.flush(FlushTarget::ThroughCurrentImm),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(result.durable_through_wal_id, Some(0));
+        assert_eq!(result.durable_through_seq, Some(2));
 
         orchestrator.close().await.unwrap();
     }
@@ -909,11 +1073,11 @@ mod tests {
         let (first, second) = tokio::join!(
             timeout(
                 Duration::from_secs(5),
-                orchestrator.flush(FlushGuarantee::ThroughWalId(15))
+                orchestrator.flush(FlushTarget::ThroughWalId(15))
             ),
             timeout(
                 Duration::from_secs(5),
-                orchestrator.flush(FlushGuarantee::ThroughWalId(15))
+                orchestrator.flush(FlushTarget::ThroughWalId(15))
             )
         );
 
@@ -922,6 +1086,38 @@ mod tests {
         assert_eq!(first.durable_through_wal_id, Some(15));
         assert_eq!(first.durable_through_seq, Some(1));
         assert_eq!(second, first);
+
+        orchestrator.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_current_imm_waits_for_flush_barrier() {
+        let harness = setup_harness(
+            "/tmp/test_parallel_l0_flush_orchestrator_checkpoint_current_imm",
+            Settings::default(),
+            Arc::new(FailPointRegistry::new()),
+        )
+        .await;
+        freeze_value_imm(&harness, b"k1", b"v1", 1, 0);
+        let before =
+            latest_manifest_checkpoint_count(&harness.path, Arc::clone(&harness.object_store))
+                .await;
+        let path = harness.path.clone();
+        let object_store = Arc::clone(&harness.object_store);
+        let mut orchestrator = start_orchestrator(harness);
+
+        let checkpoint = timeout(
+            Duration::from_secs(5),
+            orchestrator
+                .create_checkpoint(FlushTarget::ThroughCurrentImm, CheckpointOptions::default()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let after = latest_manifest_checkpoint_count(&path, object_store).await;
+        assert!(checkpoint.manifest_id > 0);
+        assert_eq!(after, before + 1);
 
         orchestrator.close().await.unwrap();
     }
@@ -944,7 +1140,8 @@ mod tests {
 
         let checkpoint = timeout(
             Duration::from_secs(5),
-            orchestrator.create_checkpoint(CheckpointScope::All, CheckpointOptions::default()),
+            orchestrator
+                .create_checkpoint(FlushTarget::ThroughWalId(21), CheckpointOptions::default()),
         )
         .await
         .unwrap()
@@ -978,8 +1175,8 @@ mod tests {
         let mut orchestrator = start_orchestrator(harness);
 
         {
-            let checkpoint =
-                orchestrator.create_checkpoint(CheckpointScope::All, CheckpointOptions::default());
+            let checkpoint = orchestrator
+                .create_checkpoint(FlushTarget::ThroughWalId(61), CheckpointOptions::default());
             tokio::pin!(checkpoint);
             assert!(timeout(Duration::from_millis(100), &mut checkpoint)
                 .await
@@ -1015,7 +1212,7 @@ mod tests {
 
         let err = timeout(
             Duration::from_secs(5),
-            orchestrator.flush(FlushGuarantee::ThroughWalId(31)),
+            orchestrator.flush(FlushTarget::ThroughWalId(31)),
         )
         .await
         .unwrap()
@@ -1044,7 +1241,7 @@ mod tests {
         let mut orchestrator = start_orchestrator(harness);
 
         {
-            let flush = orchestrator.flush(FlushGuarantee::ThroughWalId(41));
+            let flush = orchestrator.flush(FlushTarget::ThroughWalId(41));
             tokio::pin!(flush);
             assert!(timeout(Duration::from_millis(100), &mut flush)
                 .await
@@ -1080,7 +1277,7 @@ mod tests {
         let mut orchestrator = start_orchestrator_without_reader(harness);
 
         {
-            let flush = orchestrator.flush(FlushGuarantee::ThroughWalId(71));
+            let flush = orchestrator.flush(FlushTarget::ThroughWalId(71));
             tokio::pin!(flush);
             assert!(timeout(Duration::from_millis(100), &mut flush)
                 .await

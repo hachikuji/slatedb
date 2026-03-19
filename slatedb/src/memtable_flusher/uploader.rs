@@ -549,7 +549,6 @@ mod tests {
             fp_registry.clone(),
             None,
         ));
-        let (memtable_flush_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let (write_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let inner = Arc::new(
             DbInner::new(
@@ -558,7 +557,6 @@ mod tests {
                 Arc::clone(&rand),
                 Arc::clone(&table_store),
                 stored_manifest.prepare_dirty().unwrap(),
-                memtable_flush_tx,
                 write_tx,
                 Arc::clone(&stat_registry),
                 fp_registry,

@@ -111,7 +111,6 @@ impl WalBufferManager {
         wal_id_incrementor: Arc<dyn WalIdStore + Send + Sync>,
         db_state: Arc<RwLock<DbState>>,
         db_stats: DbStats,
-        recent_flushed_wal_id: u64,
         oracle: Arc<DbOracle>,
         table_store: Arc<TableStore>,
         mono_clock: Arc<MonotonicClock>,
@@ -124,7 +123,7 @@ impl WalBufferManager {
             current_wal,
             immutable_wals,
             last_applied_seq: None,
-            recent_flushed_wal_id,
+            recent_flushed_wal_id: 0,
             flush_tx: None,
             task_executor: None,
             oracle,
@@ -166,6 +165,11 @@ impl WalBufferManager {
             inner.task_executor = Some(task_executor);
         }
         result
+    }
+
+    pub(crate) fn set_recent_flushed_wal_id(&self, recent_flushed_wal_id: u64) {
+        let mut inner = self.inner.write();
+        inner.recent_flushed_wal_id = recent_flushed_wal_id;
     }
 
     #[cfg(test)]
@@ -831,7 +835,6 @@ mod tests {
             wal_id_store,
             db_state.clone(),
             DbStats::new(&StatRegistry::new()),
-            0, // recent_flushed_wal_id
             oracle,
             table_store.clone(),
             mono_clock,
@@ -843,6 +846,7 @@ mod tests {
             system_clock.clone(),
         ));
         wal_buffer.init(task_executor.clone()).await.unwrap();
+        wal_buffer.set_recent_flushed_wal_id(0);
         task_executor
             .monitor_on(&Handle::current())
             .expect("failed to monitor executor");

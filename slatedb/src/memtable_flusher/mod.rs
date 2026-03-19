@@ -17,4 +17,4 @@ pub(crate) mod sequencer;
 pub(crate) mod uploader;
 
 #[allow(unused_imports)]
-pub(crate) use flusher::{FlushGuarantee, FlushResult, MemtableFlusher};
+pub(crate) use flusher::{FlushResult, FlushTarget, MemtableFlusher};

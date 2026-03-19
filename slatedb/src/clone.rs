@@ -659,7 +659,6 @@ mod tests {
             .unwrap();
         parent_db.flush().await.unwrap();
         parent_db.close().await.unwrap();
-
         fail_parallel::cfg(
             Arc::clone(&fp_registry),
             "copy-wal-ssts-io-error",
