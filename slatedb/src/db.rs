@@ -61,7 +61,7 @@ use crate::iter::IterationOrder;
 use crate::manifest::store::FenceableManifest;
 use crate::manifest::{Manifest, ManifestCore};
 use crate::mem_table::WritableKVTable;
-use crate::memtable_flusher::{FlushTarget, MemtableFlusher};
+use crate::memtable_flusher::{FlushResult, FlushTarget, MemtableFlusher};
 use crate::oracle::{DbOracle, Oracle};
 use crate::paths::PathResolver;
 use crate::rand::DbRand;
@@ -417,11 +417,9 @@ impl DbInner {
     pub(crate) async fn flush_memtables(
         &self,
         through_wal_id: Option<u64>,
-    ) -> Result<(), SlateDBError> {
-        match self.prepare_memtable_flush_target(through_wal_id)? {
-            Some(guarantee) => self.memtable_flusher()?.flush(guarantee).await.map(|_| ()),
-            None => Ok(()),
-        }
+    ) -> Result<FlushResult, SlateDBError> {
+        let target = self.prepare_memtable_flush_target(through_wal_id)?;
+        self.memtable_flusher()?.flush(target).await
     }
 
     pub(crate) fn memtable_flusher(&self) -> Result<&Arc<MemtableFlusher>, SlateDBError> {
@@ -501,7 +499,7 @@ impl DbInner {
                 } else {
                     None
                 };
-                self.flush_memtables(through_wal_id).await
+                self.flush_memtables(through_wal_id).await.map(|_| ())
             }
         }
     }

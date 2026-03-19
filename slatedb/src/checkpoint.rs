@@ -32,22 +32,20 @@ impl Db {
         scope: CheckpointScope,
         options: &CheckpointOptions,
     ) -> Result<CheckpointCreateResult, crate::Error> {
-        let guarantee = match scope {
+        let target = match scope {
             CheckpointScope::All => {
                 let through_wal_id = if self.inner.wal_enabled {
                     Some(self.inner.flush_wals().await?)
                 } else {
                     None
                 };
-                self.inner
-                    .prepare_memtable_flush_target(through_wal_id)?
-                    .unwrap_or(FlushTarget::CurrentDurable)
+                self.inner.prepare_memtable_flush_target(through_wal_id)?
             }
             CheckpointScope::Durable => FlushTarget::CurrentDurable,
         };
         self.inner
             .memtable_flusher()?
-            .create_checkpoint(guarantee, options.clone())
+            .create_checkpoint(target, options.clone())
             .await
             .map_err(Into::into)
     }

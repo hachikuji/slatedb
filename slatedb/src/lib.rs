@@ -116,6 +116,7 @@ mod garbage_collector;
 mod iter;
 mod map_iter;
 mod mem_table;
+#[allow(dead_code)]
 mod mem_table_flush;
 #[allow(dead_code)]
 mod memtable_flusher;

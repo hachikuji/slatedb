@@ -57,7 +57,7 @@ impl DbInner {
     pub(crate) fn prepare_memtable_flush_target(
         &self,
         through_wal_id: Option<u64>,
-    ) -> Result<Option<FlushTarget>, SlateDBError> {
+    ) -> Result<FlushTarget, SlateDBError> {
         {
             let mut guard = self.state.write();
             if !guard.memtable().is_empty() {
@@ -70,22 +70,13 @@ impl DbInner {
             }
         }
 
-        let has_imm = {
-            let guard = self.state.read();
-            !guard.state().imm_memtable.is_empty()
-        };
-
-        if !has_imm {
-            return Ok(None);
-        }
-
-        Ok(Some(if self.wal_enabled {
+        Ok(if self.wal_enabled {
             FlushTarget::ThroughWalId(
                 through_wal_id.unwrap_or(self.wal_buffer.recent_flushed_wal_id()),
             )
         } else {
             FlushTarget::ThroughCurrentImm
-        }))
+        })
     }
 
     pub(crate) fn replay_memtable(

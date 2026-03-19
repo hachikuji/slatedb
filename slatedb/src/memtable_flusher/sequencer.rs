@@ -75,7 +75,7 @@ impl UploadedMemtable {
 /// Command submitted to the sequencer.
 enum SequencerCommand {
     /// One uploaded table is ready for ordered retirement.
-    Uploaded(UploadedMemtable),
+    Uploaded(Box<UploadedMemtable>),
     /// Create a checkpoint against the current durable manifest state.
     CreateCheckpoint {
         through_epoch: Option<FlushEpoch>,
@@ -190,7 +190,7 @@ impl Sequencer {
             .ok_or(SlateDBError::Closed)?
             .send_safely(
                 self.closed_result.reader(),
-                SequencerCommand::Uploaded(uploaded_memtable),
+                SequencerCommand::Uploaded(Box::new(uploaded_memtable)),
             )
     }
 
@@ -313,7 +313,7 @@ impl SequencerTask {
         for command in commands {
             match command {
                 SequencerCommand::Uploaded(uploaded_memtable) => {
-                    self.handle_uploaded(uploaded_memtable).await?;
+                    self.handle_uploaded(*uploaded_memtable).await?;
                 }
                 SequencerCommand::CreateCheckpoint {
                     through_epoch,
@@ -553,7 +553,7 @@ impl SequencerTask {
         let mut checkpoint_results = Vec::new();
         for options in checkpoint_options {
             let id = self.db.rand.rng().gen_uuid();
-            let checkpoint = self.manifest.new_checkpoint(id, *options)?;
+            let checkpoint = self.manifest.new_checkpoint(id, options)?;
             let manifest_id = checkpoint.manifest_id;
             dirty.value.core.checkpoints.push(checkpoint);
             checkpoint_results.push(CheckpointCreateResult { id, manifest_id });

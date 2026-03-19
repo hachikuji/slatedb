@@ -35,7 +35,7 @@ use tokio::time;
 
 use super::FlushEpoch;
 
-/// Flush request guarantee exposed by the memtable flusher.
+/// Flush request target exposed by the memtable flusher.
 pub(crate) enum FlushTarget {
     /// Attempt to make progress without waiting for a specific durability frontier.
     BestEffort,
@@ -88,11 +88,11 @@ pub(crate) struct MemtableFlusher {
 
 enum OrchestratorCommand {
     Flush {
-        guarantee: FlushTarget,
+        target: FlushTarget,
         sender: Option<oneshot::Sender<Result<FlushResult, SlateDBError>>>,
     },
     CreateCheckpoint {
-        guarantee: FlushTarget,
+        target: FlushTarget,
         options: CheckpointOptions,
         sender: oneshot::Sender<Result<CheckpointCreateResult, SlateDBError>>,
     },
@@ -147,8 +147,8 @@ impl MemtableFlusher {
         }
     }
 
-    /// Processes one flush request using the requested guarantee.
-    pub(crate) async fn flush(&self, guarantee: FlushTarget) -> Result<FlushResult, SlateDBError> {
+    /// Processes one flush request using the requested target.
+    pub(crate) async fn flush(&self, target: FlushTarget) -> Result<FlushResult, SlateDBError> {
         if let Some(err) = self.poisoned.lock().clone() {
             return Err(err);
         }
@@ -160,7 +160,7 @@ impl MemtableFlusher {
             .send_safely(
                 self.closed_result.reader(),
                 OrchestratorCommand::Flush {
-                    guarantee,
+                    target,
                     sender: Some(tx),
                 },
             )?;
@@ -168,7 +168,7 @@ impl MemtableFlusher {
     }
 
     /// Schedules a flush request without awaiting its result.
-    pub(crate) fn schedule_flush(&self, guarantee: FlushTarget) -> Result<(), SlateDBError> {
+    pub(crate) fn schedule_flush(&self, target: FlushTarget) -> Result<(), SlateDBError> {
         if let Some(err) = self.poisoned.lock().clone() {
             return Err(err);
         }
@@ -177,7 +177,7 @@ impl MemtableFlusher {
         };
         #[allow(clippy::disallowed_methods)]
         match commands.send(OrchestratorCommand::Flush {
-            guarantee,
+            target,
             sender: None,
         }) {
             Ok(()) => Ok(()),
@@ -197,7 +197,7 @@ impl MemtableFlusher {
     /// Creates a checkpoint using the memtable flusher's flush semantics.
     pub(crate) async fn create_checkpoint(
         &self,
-        guarantee: FlushTarget,
+        target: FlushTarget,
         options: CheckpointOptions,
     ) -> Result<CheckpointCreateResult, SlateDBError> {
         if let Some(err) = self.poisoned.lock().clone() {
@@ -211,7 +211,7 @@ impl MemtableFlusher {
             .send_safely(
                 self.closed_result.reader(),
                 OrchestratorCommand::CreateCheckpoint {
-                    guarantee,
+                    target,
                     options,
                     sender: tx,
                 },
@@ -222,7 +222,8 @@ impl MemtableFlusher {
     /// Closes the flusher and any owned subsystems.
     pub(crate) async fn close(&self) -> Result<(), SlateDBError> {
         self.commands.lock().take();
-        let result = if let Some(task) = self.task.lock().take() {
+        let task = self.task.lock().take();
+        let result = if let Some(task) = task {
             match task.await {
                 Ok(result) => result,
                 Err(join_err) if join_err.is_cancelled() => Ok(()),
@@ -281,6 +282,7 @@ impl OrchestratorTask {
         }
     }
 
+    #[allow(clippy::disallowed_methods)]
     async fn run(mut self) -> Result<(), SlateDBError> {
         let mut poll = time::interval(self.db.inner.settings.manifest_poll_interval);
         loop {
@@ -316,23 +318,23 @@ impl OrchestratorTask {
 
     async fn handle_command(&mut self, command: OrchestratorCommand) -> Result<(), SlateDBError> {
         match command {
-            OrchestratorCommand::Flush { guarantee, sender } => {
+            OrchestratorCommand::Flush { target, sender } => {
                 fail_point!(
                     Arc::clone(&self.db.inner.fp_registry),
                     "flush-memtable-to-l0"
                 );
                 self.register_new_imm_memtables();
-                let result = self.handle_flush_request(guarantee, sender).await;
+                let result = self.handle_flush_request(target, sender).await;
                 self.reconcile_and_dispatch().await?;
                 result
             }
             OrchestratorCommand::CreateCheckpoint {
-                guarantee,
+                target,
                 options,
                 sender,
             } => {
                 let result = self
-                    .handle_checkpoint_request(guarantee, options, sender)
+                    .handle_checkpoint_request(target, options, sender)
                     .await;
                 self.reconcile_and_dispatch().await?;
                 result
@@ -342,10 +344,10 @@ impl OrchestratorTask {
 
     async fn handle_flush_request(
         &mut self,
-        guarantee: FlushTarget,
+        target: FlushTarget,
         sender: Option<oneshot::Sender<Result<FlushResult, SlateDBError>>>,
     ) -> Result<(), SlateDBError> {
-        match guarantee {
+        match target {
             FlushTarget::BestEffort => {
                 if let Some(sender) = sender {
                     let _ = sender.send(Ok(self.flush_result()));
@@ -409,11 +411,11 @@ impl OrchestratorTask {
 
     async fn handle_checkpoint_request(
         &mut self,
-        guarantee: FlushTarget,
+        target: FlushTarget,
         options: CheckpointOptions,
         sender: oneshot::Sender<Result<CheckpointCreateResult, SlateDBError>>,
     ) -> Result<(), SlateDBError> {
-        match guarantee {
+        match target {
             FlushTarget::BestEffort => {
                 let result = self.sequencer.create_checkpoint(None, options).await;
                 let _ = sender.send(result);
@@ -992,7 +994,7 @@ mod tests {
         )
         .await;
         freeze_value_imm(&harness, b"k1", b"v1", 1, 11);
-        let mut orchestrator = start_orchestrator(harness);
+        let orchestrator = start_orchestrator(harness);
 
         let result = timeout(
             Duration::from_secs(5),
@@ -1017,7 +1019,7 @@ mod tests {
         )
         .await;
         freeze_value_imm(&harness, b"k1", b"v1", 1, 11);
-        let mut orchestrator = start_orchestrator(harness);
+        let orchestrator = start_orchestrator(harness);
 
         let result = timeout(
             Duration::from_secs(5),
@@ -1043,7 +1045,7 @@ mod tests {
         .await;
         freeze_value_imm(&harness, b"k1", b"v1", 1, 0);
         freeze_value_imm(&harness, b"k2", b"v2", 2, 0);
-        let mut orchestrator = start_orchestrator(harness);
+        let orchestrator = start_orchestrator(harness);
 
         let result = timeout(
             Duration::from_secs(5),
@@ -1068,7 +1070,7 @@ mod tests {
         )
         .await;
         freeze_value_imm(&harness, b"k1", b"v1", 1, 15);
-        let mut orchestrator = start_orchestrator(harness);
+        let orchestrator = start_orchestrator(harness);
 
         let (first, second) = tokio::join!(
             timeout(
@@ -1104,7 +1106,7 @@ mod tests {
                 .await;
         let path = harness.path.clone();
         let object_store = Arc::clone(&harness.object_store);
-        let mut orchestrator = start_orchestrator(harness);
+        let orchestrator = start_orchestrator(harness);
 
         let checkpoint = timeout(
             Duration::from_secs(5),
@@ -1136,7 +1138,7 @@ mod tests {
                 .await;
         let path = harness.path.clone();
         let object_store = Arc::clone(&harness.object_store);
-        let mut orchestrator = start_orchestrator(harness);
+        let orchestrator = start_orchestrator(harness);
 
         let checkpoint = timeout(
             Duration::from_secs(5),
@@ -1156,9 +1158,11 @@ mod tests {
 
     #[tokio::test]
     async fn checkpoint_all_waits_for_manifest_refresh_when_l0_is_full() {
-        let mut settings = Settings::default();
-        settings.l0_max_ssts = 1;
-        settings.manifest_poll_interval = Duration::from_millis(10);
+        let settings = Settings {
+            l0_max_ssts: 1,
+            manifest_poll_interval: Duration::from_millis(10),
+            ..Settings::default()
+        };
         let harness = setup_harness(
             "/tmp/test_parallel_l0_flush_orchestrator_checkpoint_l0_backpressure",
             settings,
@@ -1172,7 +1176,7 @@ mod tests {
                 .await;
         let path = harness.path.clone();
         let object_store = Arc::clone(&harness.object_store);
-        let mut orchestrator = start_orchestrator(harness);
+        let orchestrator = start_orchestrator(harness);
 
         {
             let checkpoint = orchestrator
@@ -1208,7 +1212,7 @@ mod tests {
         )
         .await;
         freeze_merge_imm(&harness, b"k1", b"merge", 1, 31);
-        let mut orchestrator = start_orchestrator(harness);
+        let orchestrator = start_orchestrator(harness);
 
         let err = timeout(
             Duration::from_secs(5),
@@ -1225,9 +1229,11 @@ mod tests {
 
     #[tokio::test]
     async fn should_wait_for_manifest_refresh_before_dispatching_when_l0_is_full() {
-        let mut settings = Settings::default();
-        settings.l0_max_ssts = 1;
-        settings.manifest_poll_interval = Duration::from_millis(10);
+        let settings = Settings {
+            l0_max_ssts: 1,
+            manifest_poll_interval: Duration::from_millis(10),
+            ..Settings::default()
+        };
         let harness = setup_harness(
             "/tmp/test_parallel_l0_flush_orchestrator_l0_backpressure",
             settings,
@@ -1238,7 +1244,7 @@ mod tests {
         freeze_value_imm(&harness, b"k1", b"v1", 1, 41);
         let path = harness.path.clone();
         let object_store = Arc::clone(&harness.object_store);
-        let mut orchestrator = start_orchestrator(harness);
+        let orchestrator = start_orchestrator(harness);
 
         {
             let flush = orchestrator.flush(FlushTarget::ThroughWalId(41));
@@ -1262,9 +1268,11 @@ mod tests {
 
     #[tokio::test]
     async fn should_fallback_to_local_l0_tracking_when_manifest_reader_is_absent() {
-        let mut settings = Settings::default();
-        settings.l0_max_ssts = 1;
-        settings.manifest_poll_interval = Duration::from_millis(10);
+        let settings = Settings {
+            l0_max_ssts: 1,
+            manifest_poll_interval: Duration::from_millis(10),
+            ..Settings::default()
+        };
         let harness = setup_harness(
             "/tmp/test_parallel_l0_flush_orchestrator_local_l0_fallback",
             settings,
@@ -1274,7 +1282,7 @@ mod tests {
         set_local_l0_len(&harness, 1);
         freeze_value_imm(&harness, b"k1", b"v1", 1, 71);
         let inner = Arc::clone(&harness.inner);
-        let mut orchestrator = start_orchestrator_without_reader(harness);
+        let orchestrator = start_orchestrator_without_reader(harness);
 
         {
             let flush = orchestrator.flush(FlushTarget::ThroughWalId(71));
