@@ -10,6 +10,7 @@ use tokio::{
     runtime::Handle,
     select,
     sync::{mpsc, oneshot},
+    time::Instant,
 };
 use tracing::instrument;
 
@@ -368,9 +369,20 @@ impl WalBufferManager {
         }
 
         let encoded_sst = sst_builder.build().await?;
+        let written_bytes = encoded_sst.remaining_len() as u64;
+        #[allow(clippy::disallowed_methods)]
+        let start = Instant::now();
         self.table_store
             .write_sst(&SsTableId::Wal(wal_id), encoded_sst, false)
             .await?;
+        self.db_stats.wal_flush_bytes.add(written_bytes);
+        let elapsed = start.elapsed().as_secs_f64();
+        let throughput = if elapsed > 0.0 {
+            (written_bytes as f64 / elapsed) as u64
+        } else {
+            written_bytes
+        };
+        self.db_stats.wal_flush_throughput.set(throughput);
 
         self.mono_clock.fetch_max_last_durable_tick(last_tick);
         Ok(())
@@ -610,7 +622,7 @@ mod tests {
     use crate::manifest::store::test_utils::new_dirty_manifest;
     use crate::object_stores::ObjectStores;
     use crate::sst_iter::{SstIterator, SstIteratorOptions};
-    use crate::stats::StatRegistry;
+    use crate::stats::{ReadableStat, StatRegistry};
     use crate::tablestore::TableStore;
     use crate::types::{RowEntry, ValueDeletable};
     use bytes::Bytes;
@@ -893,6 +905,8 @@ mod tests {
         assert_eq!(read_entry2.seq, entry2.seq);
 
         assert!(iter.next().await.unwrap().is_none());
+        assert!(wal_buffer.db_stats.wal_flush_bytes.get() > 0);
+        assert!(wal_buffer.db_stats.wal_flush_throughput.get() >= 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

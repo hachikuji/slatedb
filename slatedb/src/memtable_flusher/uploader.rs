@@ -477,10 +477,27 @@ impl UploadWorker {
             .table()
             .last_seq()
             .expect("flush of l0 with no entries");
+        let written_bytes = encoded_sst.remaining_len() as u64;
+        let start = self.db.system_clock.now();
         let sst_handle = self
             .db
             .upload_compacted_sst(&job.sst_id, job.imm_memtable.table(), encoded_sst, true)
             .await?;
+        self.db.db_stats.l0_flush_bytes.add(written_bytes);
+        let elapsed = self
+            .db
+            .system_clock
+            .now()
+            .signed_duration_since(start)
+            .to_std()
+            .map(|duration| duration.as_secs_f64())
+            .unwrap_or(0.0);
+        let throughput = if elapsed > 0.0 {
+            (written_bytes as f64 / elapsed) as u64
+        } else {
+            written_bytes
+        };
+        self.db.db_stats.l0_flush_throughput.set(throughput);
 
         Ok(UploadSuccess {
             epoch: job.epoch,
@@ -503,7 +520,7 @@ mod tests {
     use crate::object_stores::ObjectStores;
     use crate::paths::PathResolver;
     use crate::rand::DbRand;
-    use crate::stats::StatRegistry;
+    use crate::stats::{ReadableStat, StatRegistry};
     use crate::tablestore::TableStore;
     use crate::types::RowEntry;
     use crate::utils::IdGenerator;
@@ -624,6 +641,8 @@ mod tests {
             }
             UploaderEvent::Fatal(err) => panic!("unexpected fatal uploader event: {err:?}"),
         }
+        assert!(harness.inner.db_stats.l0_flush_bytes.get() > 0);
+        assert!(harness.inner.db_stats.l0_flush_throughput.get() >= 0);
 
         uploader.close().await.unwrap();
     }
