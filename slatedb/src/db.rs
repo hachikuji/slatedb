@@ -1711,7 +1711,10 @@ mod tests {
     use crate::db::builder::GarbageCollectorBuilder;
     use crate::db_common::MAX_WAL_FLUSHES_BEFORE_L0_FLUSH;
     use crate::db_state::ManifestCore;
-    use crate::db_stats::IMMUTABLE_MEMTABLE_FLUSHES;
+    use crate::db_stats::{
+        IMMUTABLE_MEMTABLE_FLUSHES, L0_FLUSH_BYTES, L0_FLUSH_THROUGHPUT_BYTES_PER_SEC,
+        WAL_FLUSH_BYTES, WAL_FLUSH_THROUGHPUT_BYTES_PER_SEC,
+    };
     use crate::format::sst::SsTableFormat;
     use crate::iter::RowEntryIterator;
     use crate::manifest::store::{ManifestStore, StoredManifest};
@@ -3958,6 +3961,24 @@ mod tests {
             .unwrap()
             .get();
         assert!(final_flush_count > initial_flush_count);
+        assert!(kv_store.metrics().lookup(L0_FLUSH_BYTES).unwrap().get() > 0);
+        assert!(
+            kv_store
+                .metrics()
+                .lookup(L0_FLUSH_THROUGHPUT_BYTES_PER_SEC)
+                .unwrap()
+                .get()
+                >= 0
+        );
+        assert!(kv_store.metrics().lookup(WAL_FLUSH_BYTES).unwrap().get() > 0);
+        assert!(
+            kv_store
+                .metrics()
+                .lookup(WAL_FLUSH_THROUGHPUT_BYTES_PER_SEC)
+                .unwrap()
+                .get()
+                >= 0
+        );
 
         // Verify that the WAL was also flushed since we guarantee
         // memtable data is persisted in the WAL prior to L0 flush.

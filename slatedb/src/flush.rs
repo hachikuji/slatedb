@@ -24,10 +24,26 @@ impl DbInner {
         }
 
         let encoded_sst = sst_builder.build().await?;
+        let written_bytes = encoded_sst.remaining_len() as u64;
+        let start = self.system_clock.now();
         let handle = self
             .table_store
             .write_sst(id, encoded_sst, write_cache)
             .await?;
+        self.db_stats.l0_flush_bytes.add(written_bytes);
+        let elapsed = self
+            .system_clock
+            .now()
+            .signed_duration_since(start)
+            .to_std()
+            .map(|duration| duration.as_secs_f64())
+            .unwrap_or(0.0);
+        let throughput = if elapsed > 0.0 {
+            (written_bytes as f64 / elapsed) as u64
+        } else {
+            written_bytes
+        };
+        self.db_stats.l0_flush_throughput.set(throughput);
 
         self.mono_clock
             .fetch_max_last_durable_tick(imm_table.last_tick());
