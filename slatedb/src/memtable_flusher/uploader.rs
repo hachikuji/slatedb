@@ -28,6 +28,7 @@ use crate::stats::StatRegistry;
 use crate::tablestore::TableStore;
 use crate::transaction_manager::TransactionManager;
 use crate::utils::{SendSafely, WatchableOnceCell, WatchableOnceCellReader};
+use log::info;
 use parking_lot::Mutex;
 use slatedb_common::clock::SystemClock;
 use std::sync::Arc;
@@ -498,6 +499,13 @@ impl UploadWorker {
             written_bytes
         };
         self.db.db_stats.l0_flush_throughput.set(throughput);
+        info!(
+            "l0 upload complete [epoch={}, wal_id={}, sst_id={:?}, bytes={}]",
+            job.epoch.0,
+            job.imm_memtable.recent_flushed_wal_id(),
+            job.sst_id,
+            written_bytes,
+        );
 
         Ok(UploadSuccess {
             epoch: job.epoch,

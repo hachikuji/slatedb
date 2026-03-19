@@ -1,3 +1,4 @@
+use log::info;
 use parking_lot::RwLockWriteGuard;
 
 use crate::db::DbInner;
@@ -33,6 +34,13 @@ impl DbInner {
         {
             Ok(())
         } else {
+            info!(
+                "memtable flush trigger [wal_id={}, last_freeze_wal_id={}, estimated_l0_bytes={}, l0_sst_size_bytes={}]",
+                wal_id,
+                last_freeze_wal_id,
+                l0_sst_size_est,
+                self.settings.l0_sst_size_bytes,
+            );
             self.freeze_memtable(guard, wal_id)
         }
     }
@@ -47,6 +55,11 @@ impl DbInner {
         }
 
         guard.freeze_memtable(wal_id)?;
+        info!(
+            "memtable frozen for flush [wal_id={}, imm_count={}]",
+            wal_id,
+            guard.state().imm_memtable.len(),
+        );
         if let Ok(memtable_flusher) = self.memtable_flusher() {
             // Best-effort scheduling should not break startup recovery or shutdown.
             let _ = memtable_flusher.schedule_flush(FlushTarget::BestEffort);
