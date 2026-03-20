@@ -23,7 +23,7 @@ use crate::memtable_flusher::uploader::{UploadJob, Uploader, UploaderEvent};
 use crate::oracle::Oracle;
 use crate::utils::{IdGenerator, SendSafely, WatchableOnceCell};
 use fail_parallel::fail_point;
-use log::debug;
+use log::{debug, info};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -364,13 +364,26 @@ impl FlusherTask {
         target: FlushTarget,
         sender: Option<oneshot::Sender<Result<FlushResult, SlateDBError>>>,
     ) -> Result<(), SlateDBError> {
+        info!(
+            "flusher received flush request [target={}]",
+            Self::target_name(&target)
+        );
         match self.resolve_target(target) {
             TargetResolution::Immediate => {
+                info!(
+                    "flusher resolved flush request immediately [durable_wal_id={:?}, durable_seq={:?}]",
+                    self.durable_state.wal_id,
+                    self.durable_state.seq,
+                );
                 if let Some(sender) = sender {
                     let _ = sender.send(Ok(self.flush_result()));
                 }
             }
             TargetResolution::Wait(requirement) => {
+                info!(
+                    "flusher queued flush request [requirement={}]",
+                    Self::requirement_name(requirement),
+                );
                 if let Some(sender) = sender {
                     self.pending_flushes.push(PendingFlush {
                         requirement,
@@ -388,6 +401,10 @@ impl FlusherTask {
         options: CheckpointOptions,
         sender: oneshot::Sender<Result<CheckpointCreateResult, SlateDBError>>,
     ) -> Result<(), SlateDBError> {
+        info!(
+            "flusher received checkpoint request [target={}]",
+            Self::target_name(&target),
+        );
         match self.resolve_target(target) {
             TargetResolution::Immediate => {
                 let result = self.sequencer.create_checkpoint(None, options).await;
@@ -440,6 +457,12 @@ impl FlusherTask {
     async fn handle_uploader_event(&mut self, event: UploaderEvent) -> Result<(), SlateDBError> {
         match event {
             UploaderEvent::Uploaded(success) => {
+                info!(
+                    "flusher observed upload completion [epoch={}, wal_id={}, sst_id={:?}]",
+                    success.epoch.0,
+                    success.imm_memtable.recent_flushed_wal_id(),
+                    success.sst_id,
+                );
                 if let Some(tracked) = self
                     .tracked_imms
                     .iter_mut()
@@ -482,6 +505,12 @@ impl FlusherTask {
                     wal_id: through_wal_id.or(self.durable_state.wal_id),
                     seq: Some(through_seq),
                 };
+                info!(
+                    "flusher observed durable progress [through_epoch={}, through_wal_id={:?}, through_seq={}]",
+                    through_epoch.0,
+                    self.durable_state.wal_id,
+                    through_seq,
+                );
                 self.resolve_flush_waiters();
                 self.resolve_checkpoint_waiters().await?;
                 self.reconcile_and_dispatch().await
@@ -555,6 +584,12 @@ impl FlusherTask {
                 imm_memtable: Arc::clone(imm_memtable),
                 state: TrackedImmState::PendingDispatch,
             });
+            info!(
+                "flusher registered immutable memtable [epoch={}, wal_id={}, tracked_count={}]",
+                self.next_epoch.0,
+                imm_memtable.recent_flushed_wal_id(),
+                self.tracked_imms.len(),
+            );
             self.next_epoch = FlushEpoch(self.next_epoch.0 + 1);
         }
     }
@@ -603,6 +638,14 @@ impl FlusherTask {
                     sst_id,
                 ))
                 .await?;
+            info!(
+                "flusher dispatched upload [epoch={}, wal_id={}, sst_id={:?}, durable_l0_len={}, reserved_l0_slots={}]",
+                tracked.epoch.0,
+                tracked.wal_id,
+                sst_id,
+                self.durable_l0_len,
+                reserved_l0_slots,
+            );
             tracked.state = TrackedImmState::Uploading;
         }
     }
@@ -613,6 +656,12 @@ impl FlusherTask {
         let mut pending = Vec::with_capacity(pending_flushes.len());
         for flush in pending_flushes {
             if self.requirement_satisfied(flush.requirement) {
+                info!(
+                    "flusher completed flush waiter [requirement={}, durable_wal_id={:?}, durable_seq={:?}]",
+                    Self::requirement_name(flush.requirement),
+                    flush_result.durable_through_wal_id,
+                    flush_result.durable_through_seq,
+                );
                 let _ = flush.sender.send(Ok(FlushResult {
                     durable_through_wal_id: flush_result.durable_through_wal_id,
                     durable_through_seq: flush_result.durable_through_seq,
@@ -640,6 +689,22 @@ impl FlusherTask {
         }
         self.pending_checkpoints = pending;
         Ok(())
+    }
+
+    fn target_name(target: &FlushTarget) -> &'static str {
+        match target {
+            FlushTarget::BestEffort => "best_effort",
+            FlushTarget::CurrentDurable => "current_durable",
+            FlushTarget::ThroughWalId(_) => "through_wal_id",
+            FlushTarget::ThroughCurrentImm => "through_current_imm",
+        }
+    }
+
+    fn requirement_name(requirement: FlushRequirement) -> &'static str {
+        match requirement {
+            FlushRequirement::WalId(_) => "wal_id",
+            FlushRequirement::Epoch(_) => "epoch",
+        }
     }
 
     fn requirement_satisfied(&self, requirement: FlushRequirement) -> bool {

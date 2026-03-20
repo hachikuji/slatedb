@@ -1,4 +1,4 @@
-use log::info;
+use log::debug;
 use parking_lot::RwLockWriteGuard;
 
 use crate::db::DbInner;
@@ -34,20 +34,7 @@ impl DbInner {
         {
             Ok(())
         } else {
-            assert!(
-                wal_id > last_freeze_wal_id,
-                "maybe_freeze_memtable called with non-advancing wal_id [wal_id={}, last_freeze_wal_id={}, replay_after_wal_id={}, imm_count={}, memtable_entries={}, memtable_bytes={}, estimated_l0_bytes={}, l0_sst_size_bytes={}, l0_count={}]",
-                wal_id,
-                last_freeze_wal_id,
-                guard.state().core().replay_after_wal_id,
-                guard.state().imm_memtable.len(),
-                meta.entry_num,
-                meta.entries_size_in_bytes,
-                l0_sst_size_est,
-                self.settings.l0_sst_size_bytes,
-                guard.state().core().l0.len(),
-            );
-            info!(
+            debug!(
                 "memtable flush trigger [wal_id={}, last_freeze_wal_id={}, estimated_l0_bytes={}, l0_sst_size_bytes={}]",
                 wal_id,
                 last_freeze_wal_id,
@@ -68,7 +55,7 @@ impl DbInner {
         }
 
         guard.freeze_memtable(wal_id)?;
-        info!(
+        debug!(
             "memtable frozen for flush [wal_id={}, imm_count={}]",
             wal_id,
             guard.state().imm_memtable.len(),
