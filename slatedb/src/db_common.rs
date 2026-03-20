@@ -1,3 +1,4 @@
+use log::info;
 use parking_lot::RwLockWriteGuard;
 
 use crate::db::DbInner;
@@ -48,6 +49,16 @@ impl DbInner {
         }
 
         guard.freeze_memtable(wal_id)?;
+        let imm_len = guard.state().imm_memtable.len();
+        let front_wal_id = guard
+            .state()
+            .imm_memtable
+            .front()
+            .map(|imm| imm.recent_flushed_wal_id());
+        info!(
+            "legacy freeze_memtable [wal_id={}, imm_len={}, front_wal_id={:?}]",
+            wal_id, imm_len, front_wal_id,
+        );
         self.memtable_flush_notifier.send_safely(
             guard.closed_result_reader(),
             MemtableFlushMsg::FlushImmutableMemtables { sender: None },
