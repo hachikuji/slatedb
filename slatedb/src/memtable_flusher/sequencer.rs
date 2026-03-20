@@ -28,7 +28,7 @@ use crate::tablestore::TableStore;
 use crate::transaction_manager::TransactionManager;
 use crate::utils::IdGenerator;
 use crate::utils::{SendSafely, WatchableOnceCell};
-use log::{debug, info};
+use log::debug;
 use parking_lot::Mutex;
 use slatedb_common::clock::SystemClock;
 use std::cmp;
@@ -654,16 +654,6 @@ impl SequencerTask {
         through_epoch: FlushEpoch,
         through_seq: u64,
     ) -> Result<(), SlateDBError> {
-        let through_wal_id = staged_batch
-            .last()
-            .map(|uploaded| uploaded.imm_memtable.recent_flushed_wal_id());
-        info!(
-            "manifest update complete [through_epoch={}, through_seq={}, through_wal_id={:?}, batch_len={}]",
-            through_epoch.0,
-            through_seq,
-            through_wal_id,
-            staged_batch.len(),
-        );
         self.durable_through = Some((through_epoch, through_seq));
         for uploaded in staged_batch {
             uploaded.imm_memtable.table().notify_durable(Ok(()));

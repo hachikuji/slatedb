@@ -605,7 +605,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             Some(manifest_reader),
             Uploader::start(
                 crate::memtable_flusher::uploader::UploaderDb::from_db_inner(&inner),
-                1,
+                2,
                 self.settings.manifest_poll_interval,
                 &tokio_handle,
             ),

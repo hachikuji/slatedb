@@ -240,7 +240,7 @@ impl WalBufferManager {
         &self,
     ) -> Result<WatchableOnceCellReader<Result<(), SlateDBError>>, SlateDBError> {
         // check the size of the current wal
-        let (durable_watcher, need_flush, flush_tx, flush_wal_id, should_enqueue) = {
+        let (durable_watcher, need_flush, flush_tx, should_enqueue) = {
             let mut inner = self.inner.write();
             let current_wal_size = self
                 .table_store
@@ -261,14 +261,11 @@ impl WalBufferManager {
                 inner.current_wal.durable_watcher(),
                 need_flush,
                 inner.flush_tx.clone(),
-                flush_wal_id,
                 should_enqueue,
             )
         };
         if need_flush {
             if should_enqueue {
-                #[allow(clippy::disallowed_methods)]
-                let send_started = Instant::now();
                 flush_tx
                     .as_ref()
                     .expect("flush_tx not initialized, please call init first.")
@@ -276,16 +273,6 @@ impl WalBufferManager {
                         self.db_state.read().closed_result_reader(),
                         WalFlushWork { result_tx: None },
                     )?;
-                info!(
-                    "wal flush request enqueued [explicit=false, wal_id={}, send_ms={}]",
-                    flush_wal_id,
-                    send_started.elapsed().as_millis(),
-                );
-            } else {
-                info!(
-                    "wal flush request skipped [explicit=false, wal_id={}]",
-                    flush_wal_id,
-                );
             }
         }
 
@@ -322,26 +309,13 @@ impl WalBufferManager {
             .clone()
             .expect("flush_tx not initialized, please call init first.");
         let (result_tx, result_rx) = oneshot::channel();
-        #[allow(clippy::disallowed_methods)]
-        let lock_started = Instant::now();
         let closed_reader = self.db_state.read().closed_result_reader();
-        let lock_elapsed_ms = lock_started.elapsed().as_millis();
-        info!(
-            "wal flush requested [explicit=true, db_state_read_lock_ms={}]",
-            lock_elapsed_ms,
-        );
-        #[allow(clippy::disallowed_methods)]
-        let send_started = Instant::now();
         flush_tx.send_safely(
             closed_reader,
             WalFlushWork {
                 result_tx: Some(result_tx),
             },
         )?;
-        info!(
-            "wal flush request enqueued [explicit=true, send_ms={}]",
-            send_started.elapsed().as_millis(),
-        );
         select! {
             result = result_rx => {
                 result?
@@ -364,33 +338,12 @@ impl WalBufferManager {
 
     #[instrument(level = "trace", skip_all, err(level = tracing::Level::DEBUG))]
     async fn do_flush(&self) -> Result<(), SlateDBError> {
-        let queued = {
-            let inner = self.inner.read();
-            inner.immutable_wals.len()
-        };
-        info!("wal flush worker starting [immutable_wals={}]", queued);
         self.freeze_current_wal()?;
         let flushing_wals = self.flushing_wals();
 
         if flushing_wals.is_empty() {
-            info!("wal flush worker finished [flushing_wals=0, elapsed_ms=0]");
             return Ok(());
         }
-
-        #[allow(clippy::disallowed_methods)]
-        let started = Instant::now();
-        info!(
-            "wal flush worker draining [flushing_wals={}, first_wal_id={}, last_wal_id={}]",
-            flushing_wals.len(),
-            flushing_wals
-                .first()
-                .map(|(wal_id, _)| *wal_id)
-                .unwrap_or_default(),
-            flushing_wals
-                .last()
-                .map(|(wal_id, _)| *wal_id)
-                .unwrap_or_default(),
-        );
 
         for (wal_id, wal) in flushing_wals.iter() {
             let result = self.do_flush_one_wal(*wal_id, wal.clone()).await;
@@ -421,11 +374,6 @@ impl WalBufferManager {
         }
 
         self.maybe_release_immutable_wals();
-        info!(
-            "wal flush worker finished [flushing_wals={}, elapsed_ms={}]",
-            flushing_wals.len(),
-            started.elapsed().as_millis(),
-        );
         Ok(())
     }
 
@@ -642,10 +590,6 @@ impl MessageHandler<WalFlushWork> for WalFlushHandler {
 
     async fn handle(&mut self, message: WalFlushWork) -> Result<(), SlateDBError> {
         let WalFlushWork { result_tx } = message;
-        info!(
-            "wal flush handler received work [explicit={}]",
-            result_tx.is_some()
-        );
         if let Some(result_tx) = result_tx {
             let result = self.wal_buffer_manager.do_flush().await;
             result_tx
