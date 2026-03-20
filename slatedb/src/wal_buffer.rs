@@ -75,6 +75,8 @@ struct WalBufferManagerInner {
     last_applied_seq: Option<u64>,
     /// The flusher will update the recent_flushed_wal_id and last_flushed_seq when the flush is done.
     recent_flushed_wal_id: u64,
+    /// Highest WAL frontier for which an implicit flush request has already been enqueued.
+    last_implicit_flush_request_wal_id: Option<u64>,
     /// The oracle to track the last flushed sequence number.
     oracle: Arc<DbOracle>,
 }
@@ -125,6 +127,7 @@ impl WalBufferManager {
             immutable_wals,
             last_applied_seq: None,
             recent_flushed_wal_id: 0,
+            last_implicit_flush_request_wal_id: None,
             flush_tx: None,
             task_executor: None,
             oracle,
@@ -237,37 +240,53 @@ impl WalBufferManager {
         &self,
     ) -> Result<WatchableOnceCellReader<Result<(), SlateDBError>>, SlateDBError> {
         // check the size of the current wal
-        let (durable_watcher, need_flush, flush_tx) = {
-            let inner = self.inner.read();
+        let (durable_watcher, need_flush, flush_tx, flush_wal_id, should_enqueue) = {
+            let mut inner = self.inner.write();
             let current_wal_size = self
                 .table_store
                 .estimate_encoded_size_wal(inner.current_wal.len(), inner.current_wal.size());
             trace!(
-                "checking flush trigger [current_wal_size={}, max_wal_bytes_size={}]",
+                "checking flush triggerw [current_wal_size={}, max_wal_bytes_size={}]",
                 format_bytes_si(current_wal_size as u64),
                 format_bytes_si(self.max_wal_bytes_size as u64),
             );
             let need_flush = current_wal_size >= self.max_wal_bytes_size;
+            let flush_wal_id = inner.recent_flushed_wal_id + inner.immutable_wals.len() as u64 + 1;
+            let should_enqueue =
+                need_flush && inner.last_implicit_flush_request_wal_id != Some(flush_wal_id);
+            if should_enqueue {
+                inner.last_implicit_flush_request_wal_id = Some(flush_wal_id);
+            }
             (
                 inner.current_wal.durable_watcher(),
                 need_flush,
                 inner.flush_tx.clone(),
+                flush_wal_id,
+                should_enqueue,
             )
         };
         if need_flush {
-            #[allow(clippy::disallowed_methods)]
-            let send_started = Instant::now();
-            flush_tx
-                .as_ref()
-                .expect("flush_tx not initialized, please call init first.")
-                .send_safely(
-                    self.db_state.read().closed_result_reader(),
-                    WalFlushWork { result_tx: None },
-                )?;
-            info!(
-                "wal flush request enqueued [explicit=false, send_ms={}]",
-                send_started.elapsed().as_millis(),
-            );
+            if should_enqueue {
+                #[allow(clippy::disallowed_methods)]
+                let send_started = Instant::now();
+                flush_tx
+                    .as_ref()
+                    .expect("flush_tx not initialized, please call init first.")
+                    .send_safely(
+                        self.db_state.read().closed_result_reader(),
+                        WalFlushWork { result_tx: None },
+                    )?;
+                info!(
+                    "wal flush request enqueued [explicit=false, wal_id={}, send_ms={}]",
+                    flush_wal_id,
+                    send_started.elapsed().as_millis(),
+                );
+            } else {
+                info!(
+                    "wal flush request skipped [explicit=false, wal_id={}]",
+                    flush_wal_id,
+                );
+            }
         }
 
         let estimated_bytes = self.estimated_bytes()?;
