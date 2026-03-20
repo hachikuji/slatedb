@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::{stream::BoxStream, StreamExt};
-use log::{error, trace};
+use log::{error, info, trace};
 use parking_lot::RwLock;
 use tokio::{
     runtime::Handle,
@@ -337,14 +337,21 @@ impl WalBufferManager {
                 return Err(e.clone());
             }
 
+            let last_seq = wal.last_seq();
+
             // increment the last flushed wal id, and last flushed seq
             {
                 let mut inner = self.inner.write();
                 inner.recent_flushed_wal_id = *wal_id;
-                if let Some(seq) = wal.last_seq() {
+                if let Some(seq) = last_seq {
                     inner.oracle.advance_durable_seq(seq);
                 }
             }
+
+            info!(
+                "legacy wal flush complete [wal_id={}, last_seq={:?}]",
+                wal_id, last_seq,
+            );
 
             // notify durable only when the flush is successful.
             wal.notify_durable(result.clone());

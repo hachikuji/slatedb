@@ -143,16 +143,29 @@ impl MemtableFlusher {
                     );
                 }
             }
+            let last_seq = imm_memtable.table().last_seq();
             let id = SsTableId::Compacted(
                 self.db_inner
                     .rand
                     .rng()
                     .gen_ulid(self.db_inner.system_clock.as_ref()),
             );
+            info!(
+                "legacy flusher dispatching memtable flush [wal_id={}, last_seq={:?}, sst_id={:?}]",
+                imm_memtable.recent_flushed_wal_id(),
+                last_seq,
+                id,
+            );
             let sst_handle = self
                 .db_inner
                 .flush_imm_table(&id, imm_memtable.table(), true)
                 .await?;
+            info!(
+                "legacy flusher completed memtable flush [wal_id={}, last_seq={:?}, sst_id={:?}]",
+                imm_memtable.recent_flushed_wal_id(),
+                last_seq,
+                id,
+            );
             fail_point!(
                 Arc::clone(&self.db_inner.fp_registry),
                 "after-flush-imm-to-l0-before-manifest"
