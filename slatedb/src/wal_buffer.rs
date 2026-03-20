@@ -297,6 +297,7 @@ impl WalBufferManager {
             .clone()
             .expect("flush_tx not initialized, please call init first.");
         let (result_tx, result_rx) = oneshot::channel();
+        info!("wal flush requested [explicit=true]");
         flush_tx.send_safely(
             self.db_state.read().closed_result_reader(),
             WalFlushWork {
@@ -325,12 +326,33 @@ impl WalBufferManager {
 
     #[instrument(level = "trace", skip_all, err(level = tracing::Level::DEBUG))]
     async fn do_flush(&self) -> Result<(), SlateDBError> {
+        let queued = {
+            let inner = self.inner.read();
+            inner.immutable_wals.len()
+        };
+        info!("wal flush worker starting [immutable_wals={}]", queued);
         self.freeze_current_wal()?;
         let flushing_wals = self.flushing_wals();
 
         if flushing_wals.is_empty() {
+            info!("wal flush worker finished [flushing_wals=0, elapsed_ms=0]");
             return Ok(());
         }
+
+        #[allow(clippy::disallowed_methods)]
+        let started = Instant::now();
+        info!(
+            "wal flush worker draining [flushing_wals={}, first_wal_id={}, last_wal_id={}]",
+            flushing_wals.len(),
+            flushing_wals
+                .first()
+                .map(|(wal_id, _)| *wal_id)
+                .unwrap_or_default(),
+            flushing_wals
+                .last()
+                .map(|(wal_id, _)| *wal_id)
+                .unwrap_or_default(),
+        );
 
         for (wal_id, wal) in flushing_wals.iter() {
             let result = self.do_flush_one_wal(*wal_id, wal.clone()).await;
@@ -361,6 +383,11 @@ impl WalBufferManager {
         }
 
         self.maybe_release_immutable_wals();
+        info!(
+            "wal flush worker finished [flushing_wals={}, elapsed_ms={}]",
+            flushing_wals.len(),
+            started.elapsed().as_millis(),
+        );
         Ok(())
     }
 
@@ -577,6 +604,10 @@ impl MessageHandler<WalFlushWork> for WalFlushHandler {
 
     async fn handle(&mut self, message: WalFlushWork) -> Result<(), SlateDBError> {
         let WalFlushWork { result_tx } = message;
+        info!(
+            "wal flush handler received work [explicit={}]",
+            result_tx.is_some()
+        );
         if let Some(result_tx) = result_tx {
             let result = self.wal_buffer_manager.do_flush().await;
             result_tx
