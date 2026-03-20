@@ -297,13 +297,26 @@ impl WalBufferManager {
             .clone()
             .expect("flush_tx not initialized, please call init first.");
         let (result_tx, result_rx) = oneshot::channel();
-        info!("wal flush requested [explicit=true]");
+        #[allow(clippy::disallowed_methods)]
+        let lock_started = Instant::now();
+        let closed_reader = self.db_state.read().closed_result_reader();
+        let lock_elapsed_ms = lock_started.elapsed().as_millis();
+        info!(
+            "wal flush requested [explicit=true, db_state_read_lock_ms={}]",
+            lock_elapsed_ms,
+        );
+        #[allow(clippy::disallowed_methods)]
+        let send_started = Instant::now();
         flush_tx.send_safely(
-            self.db_state.read().closed_result_reader(),
+            closed_reader,
             WalFlushWork {
                 result_tx: Some(result_tx),
             },
         )?;
+        info!(
+            "wal flush request enqueued [explicit=true, send_ms={}]",
+            send_started.elapsed().as_millis(),
+        );
         select! {
             result = result_rx => {
                 result?
