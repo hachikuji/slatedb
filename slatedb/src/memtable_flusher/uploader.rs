@@ -28,6 +28,7 @@ use crate::stats::StatRegistry;
 use crate::tablestore::TableStore;
 use crate::transaction_manager::TransactionManager;
 use crate::utils::{SendSafely, WatchableOnceCell, WatchableOnceCellReader};
+use log::debug;
 use parking_lot::Mutex;
 use slatedb_common::clock::SystemClock;
 use std::sync::Arc;
@@ -410,12 +411,12 @@ impl UploadWorker {
         jobs: UploadJobReceiver,
         events: UploaderEventSender,
     ) -> Result<(), SlateDBError> {
-        let _ = worker_id;
-        self.recv_loop(jobs, events).await
+        self.recv_loop(worker_id, jobs, events).await
     }
 
     async fn recv_loop(
         &self,
+        worker_id: usize,
         jobs: UploadJobReceiver,
         events: UploaderEventSender,
     ) -> Result<(), SlateDBError> {
@@ -430,7 +431,21 @@ impl UploadWorker {
                         return Ok(());
                     };
 
+                    debug!(
+                        "l0 uploader worker started job [worker_id={}, epoch={}, wal_id={}, sst_id={:?}]",
+                        worker_id,
+                        job.epoch.0,
+                        job.imm_memtable.recent_flushed_wal_id(),
+                        job.sst_id,
+                    );
                     let success = self.upload_with_retry(job).await?;
+                    debug!(
+                        "l0 uploader worker finished job [worker_id={}, epoch={}, wal_id={}, sst_id={:?}]",
+                        worker_id,
+                        success.epoch.0,
+                        success.imm_memtable.recent_flushed_wal_id(),
+                        success.sst_id,
+                    );
                     #[allow(clippy::disallowed_methods)]
                     if events.send(UploaderEvent::Uploaded(Box::new(success))).is_err() {
                         // The flusher is no longer listening for uploader events, so
