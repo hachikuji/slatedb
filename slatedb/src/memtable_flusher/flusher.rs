@@ -299,6 +299,7 @@ impl FlusherTask {
     async fn run_once(&mut self, poll: &mut time::Interval) -> Result<bool, SlateDBError> {
         tokio::select! {
             _ = poll.tick() => {
+                self.refresh_manifest_progress().await?;
                 self.reconcile_and_dispatch().await?;
                 Ok(true)
             }
@@ -520,7 +521,6 @@ impl FlusherTask {
     }
 
     async fn reconcile_and_dispatch(&mut self) -> Result<(), SlateDBError> {
-        self.refresh_manifest_progress().await?;
         self.register_new_imm_memtables();
         self.dispatch_ready_memtables().await?;
         self.resolve_flush_waiters();
