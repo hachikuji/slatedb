@@ -250,13 +250,18 @@ impl WalBufferManager {
             )
         };
         if need_flush {
+            let send_started = std::time::Instant::now();
             flush_tx
                 .as_ref()
                 .expect("flush_tx not initialized, please call init first.")
                 .send_safely(
                     self.db_state.read().closed_result_reader(),
                     WalFlushWork { result_tx: None },
-                )?
+                )?;
+            info!(
+                "legacy wal flush request enqueued [explicit=false, send_ms={}]",
+                send_started.elapsed().as_millis(),
+            );
         }
 
         let estimated_bytes = self.estimated_bytes()?;
@@ -292,12 +297,24 @@ impl WalBufferManager {
             .clone()
             .expect("flush_tx not initialized, please call init first.");
         let (result_tx, result_rx) = oneshot::channel();
+        let lock_started = std::time::Instant::now();
+        let closed_reader = self.db_state.read().closed_result_reader();
+        let lock_elapsed_ms = lock_started.elapsed().as_millis();
+        info!(
+            "legacy wal flush requested [explicit=true, db_state_read_lock_ms={}]",
+            lock_elapsed_ms,
+        );
+        let send_started = std::time::Instant::now();
         flush_tx.send_safely(
-            self.db_state.read().closed_result_reader(),
+            closed_reader,
             WalFlushWork {
                 result_tx: Some(result_tx),
             },
         )?;
+        info!(
+            "legacy wal flush request enqueued [explicit=true, send_ms={}]",
+            send_started.elapsed().as_millis(),
+        );
         select! {
             result = result_rx => {
                 result?
