@@ -255,13 +255,19 @@ impl WalBufferManager {
             )
         };
         if need_flush {
+            #[allow(clippy::disallowed_methods)]
+            let send_started = Instant::now();
             flush_tx
                 .as_ref()
                 .expect("flush_tx not initialized, please call init first.")
                 .send_safely(
                     self.db_state.read().closed_result_reader(),
                     WalFlushWork { result_tx: None },
-                )?
+                )?;
+            info!(
+                "wal flush request enqueued [explicit=false, send_ms={}]",
+                send_started.elapsed().as_millis(),
+            );
         }
 
         let estimated_bytes = self.estimated_bytes()?;
