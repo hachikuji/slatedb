@@ -123,7 +123,20 @@ impl MemtableFlusher {
             if self.db_inner.wal_enabled {
                 let last_seq = imm_memtable.table().last_seq().unwrap_or(0);
                 if self.db_inner.oracle.last_remote_persisted_seq() < last_seq {
+                    let started = std::time::Instant::now();
+                    info!(
+                        "legacy flusher awaiting wal flush before dispatch [wal_id={}, last_seq={}, remote_persisted_seq={}]",
+                        imm_memtable.recent_flushed_wal_id(),
+                        last_seq,
+                        self.db_inner.oracle.last_remote_persisted_seq(),
+                    );
                     self.db_inner.flush_wals().await?;
+                    info!(
+                        "legacy flusher completed wal flush before dispatch [wal_id={}, remote_persisted_seq={}, elapsed_ms={}]",
+                        imm_memtable.recent_flushed_wal_id(),
+                        self.db_inner.oracle.last_remote_persisted_seq(),
+                        started.elapsed().as_millis(),
+                    );
                     assert!(
                         self.db_inner.oracle.last_remote_persisted_seq() >= last_seq,
                         "flush_wals did not flush up to the last seq in the imm memtable"
