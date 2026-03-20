@@ -32,7 +32,7 @@ use log::debug;
 use parking_lot::Mutex;
 use slatedb_common::clock::SystemClock;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::task::{JoinHandle, JoinSet};
@@ -421,12 +421,17 @@ impl UploadWorker {
         events: UploaderEventSender,
     ) -> Result<(), SlateDBError> {
         loop {
+            let idle_start = Instant::now();
             tokio::select! {
                 _ = self.shutdown.cancelled() => return Ok(()),
                 recv_result = async {
                     let mut jobs = jobs.lock().await;
                     jobs.recv().await
                 } => {
+                    self.db
+                        .db_stats
+                        .l0_upload_idle_millis
+                        .add(idle_start.elapsed().as_millis() as u64);
                     let Some(job) = recv_result else {
                         return Ok(());
                     };
@@ -438,7 +443,12 @@ impl UploadWorker {
                         job.imm_memtable.recent_flushed_wal_id(),
                         job.sst_id,
                     );
+                    let busy_start = Instant::now();
                     let success = self.upload_with_retry(job).await?;
+                    self.db
+                        .db_stats
+                        .l0_upload_busy_millis
+                        .add(busy_start.elapsed().as_millis() as u64);
                     debug!(
                         "l0 uploader worker finished job [worker_id={}, epoch={}, wal_id={}, sst_id={:?}]",
                         worker_id,
