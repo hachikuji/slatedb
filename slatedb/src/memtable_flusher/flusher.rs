@@ -621,7 +621,22 @@ impl FlusherTask {
             if self.db.inner.wal_enabled {
                 let last_seq = tracked.imm_memtable.table().last_seq().unwrap_or(0);
                 if self.db.inner.oracle.last_remote_persisted_seq() < last_seq {
-                    self.db.inner.flush_wals().await?;
+                    let started = std::time::Instant::now();
+                    info!(
+                        "flusher awaiting wal flush before dispatch [epoch={}, wal_id={}, last_seq={}, remote_persisted_seq={}]",
+                        tracked.epoch.0,
+                        tracked.wal_id,
+                        last_seq,
+                        self.db.inner.oracle.last_remote_persisted_seq(),
+                    );
+                    let flushed_wal_id = self.db.inner.flush_wals().await?;
+                    info!(
+                        "flusher completed wal flush before dispatch [epoch={}, requested_wal_id={}, flushed_wal_id={}, elapsed_ms={}]",
+                        tracked.epoch.0,
+                        tracked.wal_id,
+                        flushed_wal_id,
+                        started.elapsed().as_millis(),
+                    );
                 }
             }
             let sst_id = crate::db_state::SsTableId::Compacted(
