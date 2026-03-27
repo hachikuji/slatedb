@@ -25,6 +25,16 @@ pub const L0_SST_COUNT: &str = db_stat_name!("l0_sst_count");
 pub const L0_FLUSH_BYTES: &str = db_stat_name!("l0_flush_bytes");
 pub const L0_UPLOAD_BUSY_MILLIS: &str = db_stat_name!("l0_upload_busy_millis");
 pub const L0_UPLOAD_IDLE_MILLIS: &str = db_stat_name!("l0_upload_idle_millis");
+pub const WAL_FLUSH_BYTES: &str = db_stat_name!("wal_flush_bytes");
+pub const L0_FLUSH_CREATED_TO_PENDING_MILLIS: &str =
+    db_stat_name!("l0_flush_created_to_pending_millis");
+pub const L0_FLUSH_PENDING_TO_UPLOADING_MILLIS: &str =
+    db_stat_name!("l0_flush_pending_to_uploading_millis");
+pub const L0_FLUSH_UPLOADING_TO_WRITING_MILLIS: &str =
+    db_stat_name!("l0_flush_uploading_to_writing_millis");
+pub const L0_FLUSH_WRITING_TO_COMPLETE_MILLIS: &str =
+    db_stat_name!("l0_flush_writing_to_complete_millis");
+pub const L0_FLUSH_END_TO_END_MILLIS: &str = db_stat_name!("l0_flush_end_to_end_millis");
 
 #[non_exhaustive]
 #[derive(Clone, Debug)]
@@ -47,6 +57,12 @@ pub(crate) struct DbStats {
     pub(crate) l0_flush_bytes: Arc<Counter>,
     pub(crate) l0_upload_busy_millis: Arc<Counter>,
     pub(crate) l0_upload_idle_millis: Arc<Counter>,
+    pub(crate) wal_flush_bytes: Arc<Counter>,
+    pub(crate) l0_flush_created_to_pending_millis: Arc<Counter>,
+    pub(crate) l0_flush_pending_to_uploading_millis: Arc<Counter>,
+    pub(crate) l0_flush_uploading_to_writing_millis: Arc<Counter>,
+    pub(crate) l0_flush_writing_to_complete_millis: Arc<Counter>,
+    pub(crate) l0_flush_end_to_end_millis: Arc<Counter>,
 }
 
 impl DbStats {
@@ -70,6 +86,12 @@ impl DbStats {
             l0_flush_bytes: Arc::new(Counter::default()),
             l0_upload_busy_millis: Arc::new(Counter::default()),
             l0_upload_idle_millis: Arc::new(Counter::default()),
+            wal_flush_bytes: Arc::new(Counter::default()),
+            l0_flush_created_to_pending_millis: Arc::new(Counter::default()),
+            l0_flush_pending_to_uploading_millis: Arc::new(Counter::default()),
+            l0_flush_uploading_to_writing_millis: Arc::new(Counter::default()),
+            l0_flush_writing_to_complete_millis: Arc::new(Counter::default()),
+            l0_flush_end_to_end_millis: Arc::new(Counter::default()),
         };
         registry.register(
             IMMUTABLE_MEMTABLE_FLUSHES,
@@ -101,6 +123,27 @@ impl DbStats {
         registry.register(L0_FLUSH_BYTES, stats.l0_flush_bytes.clone());
         registry.register(L0_UPLOAD_BUSY_MILLIS, stats.l0_upload_busy_millis.clone());
         registry.register(L0_UPLOAD_IDLE_MILLIS, stats.l0_upload_idle_millis.clone());
+        registry.register(WAL_FLUSH_BYTES, stats.wal_flush_bytes.clone());
+        registry.register(
+            L0_FLUSH_CREATED_TO_PENDING_MILLIS,
+            stats.l0_flush_created_to_pending_millis.clone(),
+        );
+        registry.register(
+            L0_FLUSH_PENDING_TO_UPLOADING_MILLIS,
+            stats.l0_flush_pending_to_uploading_millis.clone(),
+        );
+        registry.register(
+            L0_FLUSH_UPLOADING_TO_WRITING_MILLIS,
+            stats.l0_flush_uploading_to_writing_millis.clone(),
+        );
+        registry.register(
+            L0_FLUSH_WRITING_TO_COMPLETE_MILLIS,
+            stats.l0_flush_writing_to_complete_millis.clone(),
+        );
+        registry.register(
+            L0_FLUSH_END_TO_END_MILLIS,
+            stats.l0_flush_end_to_end_millis.clone(),
+        );
         stats
     }
 }

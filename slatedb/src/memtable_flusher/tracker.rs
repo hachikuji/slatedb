@@ -205,6 +205,9 @@ impl FlushTracker {
                 sst_id,
                 imm_memtable: Arc::clone(imm_memtable),
                 state: TrackedImmState::PendingDispatch,
+                pending_dispatch_at: std::time::Instant::now(),
+                uploading_at: None,
+                writing_manifest_at: None,
             });
             self.next_epoch = FlushEpoch(self.next_epoch.0 + 1);
         }
@@ -256,6 +259,7 @@ impl FlushTracker {
             .iter()
             .position(|tracked| matches!(tracked.state, TrackedImmState::PendingDispatch))?;
         self.tracked_imms[index].state = TrackedImmState::Uploading;
+        self.tracked_imms[index].uploading_at = Some(std::time::Instant::now());
         Some(&self.tracked_imms[index])
     }
 
@@ -265,6 +269,9 @@ impl FlushTracker {
             .iter_mut()
             .find(|tracked| tracked.epoch == epoch)
         {
+            if matches!(state, TrackedImmState::WritingManifest) {
+                tracked.writing_manifest_at = Some(std::time::Instant::now());
+            }
             tracked.state = state;
         }
     }
@@ -272,6 +279,8 @@ impl FlushTracker {
     /// Remove tracked imms through the given epoch and return the highest WAL ID.
     fn retire_through(&mut self, through_epoch: FlushEpoch) -> Option<u64> {
         let mut through_wal_id = None;
+        let now = std::time::Instant::now();
+        let db_stats = &self.inner.db_stats;
         while self
             .tracked_imms
             .front()
@@ -279,6 +288,27 @@ impl FlushTracker {
         {
             let tracked = self.tracked_imms.pop_front().expect("checked above");
             through_wal_id = Some(tracked.wal_id);
+
+            let created_at = tracked.imm_memtable.create_time();
+            let pending_at = tracked.pending_dispatch_at;
+            let uploading_at = tracked.uploading_at.unwrap_or(now);
+            let writing_at = tracked.writing_manifest_at.unwrap_or(now);
+
+            db_stats
+                .l0_flush_created_to_pending_millis
+                .add(pending_at.duration_since(created_at).as_millis() as u64);
+            db_stats
+                .l0_flush_pending_to_uploading_millis
+                .add(uploading_at.duration_since(pending_at).as_millis() as u64);
+            db_stats
+                .l0_flush_uploading_to_writing_millis
+                .add(writing_at.duration_since(uploading_at).as_millis() as u64);
+            db_stats
+                .l0_flush_writing_to_complete_millis
+                .add(now.duration_since(writing_at).as_millis() as u64);
+            db_stats
+                .l0_flush_end_to_end_millis
+                .add(now.duration_since(created_at).as_millis() as u64);
         }
         through_wal_id
     }
@@ -352,6 +382,9 @@ struct TrackedImm {
     sst_id: crate::db_state::SsTableId,
     imm_memtable: Arc<crate::mem_table::ImmutableMemtable>,
     state: TrackedImmState,
+    pending_dispatch_at: std::time::Instant,
+    uploading_at: Option<std::time::Instant>,
+    writing_manifest_at: Option<std::time::Instant>,
 }
 
 enum TrackedImmState {

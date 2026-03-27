@@ -165,6 +165,8 @@ pub(crate) struct ImmutableMemtable {
     /// A snapshot of the sequence tracker taken when this immutable memtable was created.
     /// This avoids needing to access the sequence tracker through a mutex on the underlying table.
     sequence_tracker: SequenceTracker,
+    /// The instant this immutable memtable was created (frozen from the mutable memtable).
+    create_time: std::time::Instant,
 }
 
 #[self_referencing]
@@ -224,7 +226,12 @@ impl ImmutableMemtable {
             recent_flushed_wal_id,
             flushed: WatchableOnceCell::new(),
             sequence_tracker,
+            create_time: std::time::Instant::now(),
         }
+    }
+
+    pub(crate) fn create_time(&self) -> std::time::Instant {
+        self.create_time
     }
 
     pub(crate) fn table(&self) -> Arc<KVTable> {
