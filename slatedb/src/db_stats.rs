@@ -1,6 +1,8 @@
 use crate::stats::{Counter, Gauge, StatRegistry};
 use std::sync::Arc;
 
+type MaxGauge = Gauge<u64>;
+
 macro_rules! db_stat_name {
     ($suffix:expr) => {
         crate::stat_name!("db", $suffix)
@@ -35,6 +37,16 @@ pub const L0_FLUSH_UPLOADING_TO_WRITING_MILLIS: &str =
 pub const L0_FLUSH_WRITING_TO_COMPLETE_MILLIS: &str =
     db_stat_name!("l0_flush_writing_to_complete_millis");
 pub const L0_FLUSH_END_TO_END_MILLIS: &str = db_stat_name!("l0_flush_end_to_end_millis");
+pub const L0_FLUSH_COUNT: &str = db_stat_name!("l0_flush_count");
+pub const L0_FLUSH_CREATED_TO_PENDING_MAX_MILLIS: &str =
+    db_stat_name!("l0_flush_created_to_pending_max_millis");
+pub const L0_FLUSH_PENDING_TO_UPLOADING_MAX_MILLIS: &str =
+    db_stat_name!("l0_flush_pending_to_uploading_max_millis");
+pub const L0_FLUSH_UPLOADING_TO_WRITING_MAX_MILLIS: &str =
+    db_stat_name!("l0_flush_uploading_to_writing_max_millis");
+pub const L0_FLUSH_WRITING_TO_COMPLETE_MAX_MILLIS: &str =
+    db_stat_name!("l0_flush_writing_to_complete_max_millis");
+pub const L0_FLUSH_END_TO_END_MAX_MILLIS: &str = db_stat_name!("l0_flush_end_to_end_max_millis");
 
 #[non_exhaustive]
 #[derive(Clone, Debug)]
@@ -63,6 +75,12 @@ pub(crate) struct DbStats {
     pub(crate) l0_flush_uploading_to_writing_millis: Arc<Counter>,
     pub(crate) l0_flush_writing_to_complete_millis: Arc<Counter>,
     pub(crate) l0_flush_end_to_end_millis: Arc<Counter>,
+    pub(crate) l0_flush_count: Arc<Counter>,
+    pub(crate) l0_flush_created_to_pending_max_millis: Arc<MaxGauge>,
+    pub(crate) l0_flush_pending_to_uploading_max_millis: Arc<MaxGauge>,
+    pub(crate) l0_flush_uploading_to_writing_max_millis: Arc<MaxGauge>,
+    pub(crate) l0_flush_writing_to_complete_max_millis: Arc<MaxGauge>,
+    pub(crate) l0_flush_end_to_end_max_millis: Arc<MaxGauge>,
 }
 
 impl DbStats {
@@ -92,6 +110,12 @@ impl DbStats {
             l0_flush_uploading_to_writing_millis: Arc::new(Counter::default()),
             l0_flush_writing_to_complete_millis: Arc::new(Counter::default()),
             l0_flush_end_to_end_millis: Arc::new(Counter::default()),
+            l0_flush_count: Arc::new(Counter::default()),
+            l0_flush_created_to_pending_max_millis: Arc::new(MaxGauge::default()),
+            l0_flush_pending_to_uploading_max_millis: Arc::new(MaxGauge::default()),
+            l0_flush_uploading_to_writing_max_millis: Arc::new(MaxGauge::default()),
+            l0_flush_writing_to_complete_max_millis: Arc::new(MaxGauge::default()),
+            l0_flush_end_to_end_max_millis: Arc::new(MaxGauge::default()),
         };
         registry.register(
             IMMUTABLE_MEMTABLE_FLUSHES,
@@ -143,6 +167,27 @@ impl DbStats {
         registry.register(
             L0_FLUSH_END_TO_END_MILLIS,
             stats.l0_flush_end_to_end_millis.clone(),
+        );
+        registry.register(L0_FLUSH_COUNT, stats.l0_flush_count.clone());
+        registry.register(
+            L0_FLUSH_CREATED_TO_PENDING_MAX_MILLIS,
+            stats.l0_flush_created_to_pending_max_millis.clone(),
+        );
+        registry.register(
+            L0_FLUSH_PENDING_TO_UPLOADING_MAX_MILLIS,
+            stats.l0_flush_pending_to_uploading_max_millis.clone(),
+        );
+        registry.register(
+            L0_FLUSH_UPLOADING_TO_WRITING_MAX_MILLIS,
+            stats.l0_flush_uploading_to_writing_max_millis.clone(),
+        );
+        registry.register(
+            L0_FLUSH_WRITING_TO_COMPLETE_MAX_MILLIS,
+            stats.l0_flush_writing_to_complete_max_millis.clone(),
+        );
+        registry.register(
+            L0_FLUSH_END_TO_END_MAX_MILLIS,
+            stats.l0_flush_end_to_end_max_millis.clone(),
         );
         stats
     }

@@ -294,21 +294,42 @@ impl FlushTracker {
             let uploading_at = tracked.uploading_at.unwrap_or(now);
             let writing_at = tracked.writing_manifest_at.unwrap_or(now);
 
+            let created_to_pending = pending_at.duration_since(created_at).as_millis() as u64;
+            let pending_to_uploading = uploading_at.duration_since(pending_at).as_millis() as u64;
+            let uploading_to_writing = writing_at.duration_since(uploading_at).as_millis() as u64;
+            let writing_to_complete = now.duration_since(writing_at).as_millis() as u64;
+            let end_to_end = now.duration_since(created_at).as_millis() as u64;
+
+            db_stats.l0_flush_count.inc();
             db_stats
                 .l0_flush_created_to_pending_millis
-                .add(pending_at.duration_since(created_at).as_millis() as u64);
+                .add(created_to_pending);
             db_stats
                 .l0_flush_pending_to_uploading_millis
-                .add(uploading_at.duration_since(pending_at).as_millis() as u64);
+                .add(pending_to_uploading);
             db_stats
                 .l0_flush_uploading_to_writing_millis
-                .add(writing_at.duration_since(uploading_at).as_millis() as u64);
+                .add(uploading_to_writing);
             db_stats
                 .l0_flush_writing_to_complete_millis
-                .add(now.duration_since(writing_at).as_millis() as u64);
+                .add(writing_to_complete);
+            db_stats.l0_flush_end_to_end_millis.add(end_to_end);
+
             db_stats
-                .l0_flush_end_to_end_millis
-                .add(now.duration_since(created_at).as_millis() as u64);
+                .l0_flush_created_to_pending_max_millis
+                .fetch_max(created_to_pending);
+            db_stats
+                .l0_flush_pending_to_uploading_max_millis
+                .fetch_max(pending_to_uploading);
+            db_stats
+                .l0_flush_uploading_to_writing_max_millis
+                .fetch_max(uploading_to_writing);
+            db_stats
+                .l0_flush_writing_to_complete_max_millis
+                .fetch_max(writing_to_complete);
+            db_stats
+                .l0_flush_end_to_end_max_millis
+                .fetch_max(end_to_end);
         }
         through_wal_id
     }

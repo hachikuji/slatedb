@@ -219,6 +219,26 @@ impl<T: Default + NoUninit + std::fmt::Debug> Default for Gauge<T> {
     }
 }
 
+impl Gauge<u64> {
+    pub fn fetch_max(&self, value: u64) -> u64 {
+        let mut current = self.value.load(Ordering::Relaxed);
+        loop {
+            if value <= current {
+                return current;
+            }
+            match self.value.compare_exchange_weak(
+                current,
+                value,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return value,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
 impl Gauge<i64> {
     pub fn add(&self, value: i64) -> i64 {
         self.value.fetch_add(value, Ordering::Relaxed)
