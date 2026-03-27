@@ -613,10 +613,27 @@ impl CompactorEventHandler {
             .sources()
             .iter()
             .map(|source| match source {
-                SourceId::SstView(id) => views_by_id
-                    .get(id)
-                    .expect("compaction source view not found in L0")
-                    .estimate_size(),
+                SourceId::SstView(id) => {
+                    if let Some(view) = views_by_id.get(id) {
+                        view.estimate_size()
+                    } else {
+                        let l0_ids: Vec<_> = db_state.l0.iter().map(|v| v.id).collect();
+                        eprintln!(
+                            "[compactor-bug] source view {} not found in L0. \
+                             compaction_id={}, status={:?}, \
+                             compaction_sources={:?}, \
+                             l0_ids={:?}, \
+                             last_compacted_l0={:?}",
+                            id,
+                            compaction.id(),
+                            compaction.status(),
+                            compaction.spec().sources(),
+                            l0_ids,
+                            db_state.last_compacted_l0_sst_view_id,
+                        );
+                        panic!("compaction source view not found in L0");
+                    }
+                }
                 SourceId::SortedRun(id) => srs_by_id
                     .get(id)
                     .expect("compaction source sorted run not found")
