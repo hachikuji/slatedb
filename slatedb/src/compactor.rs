@@ -987,6 +987,7 @@ pub mod stats {
     pub const READ_MILLIS: &str = compactor_stat_name!("read_millis");
     pub const WRITE_MILLIS: &str = compactor_stat_name!("write_millis");
     pub const CLOSE_MILLIS: &str = compactor_stat_name!("close_millis");
+    pub const READ_BYTES: &str = compactor_stat_name!("read_bytes");
 
     pub(crate) struct CompactionStats {
         pub(crate) last_compaction_ts: Arc<dyn GaugeFn>,
@@ -997,6 +998,7 @@ pub mod stats {
         pub(crate) read_millis: Arc<dyn CounterFn>,
         pub(crate) write_millis: Arc<dyn CounterFn>,
         pub(crate) close_millis: Arc<dyn CounterFn>,
+        pub(crate) read_bytes: Arc<dyn CounterFn>,
     }
 
     impl CompactionStats {
@@ -1010,6 +1012,7 @@ pub mod stats {
                 read_millis: recorder.counter(READ_MILLIS).register(),
                 write_millis: recorder.counter(WRITE_MILLIS).register(),
                 close_millis: recorder.counter(CLOSE_MILLIS).register(),
+                read_bytes: recorder.counter(READ_BYTES).register(),
             }
         }
     }
