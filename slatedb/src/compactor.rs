@@ -984,6 +984,9 @@ pub mod stats {
         compactor_stat_name!("total_bytes_being_compacted");
     pub const TOTAL_THROUGHPUT_BYTES_PER_SEC: &str =
         compactor_stat_name!("total_throughput_bytes_per_sec");
+    pub const READ_MILLIS: &str = compactor_stat_name!("read_millis");
+    pub const WRITE_MILLIS: &str = compactor_stat_name!("write_millis");
+    pub const CLOSE_MILLIS: &str = compactor_stat_name!("close_millis");
 
     pub(crate) struct CompactionStats {
         pub(crate) last_compaction_ts: Arc<dyn GaugeFn>,
@@ -991,6 +994,9 @@ pub mod stats {
         pub(crate) bytes_compacted: Arc<dyn CounterFn>,
         pub(crate) total_bytes_being_compacted: Arc<dyn GaugeFn>,
         pub(crate) total_throughput: Arc<dyn GaugeFn>,
+        pub(crate) read_millis: Arc<dyn CounterFn>,
+        pub(crate) write_millis: Arc<dyn CounterFn>,
+        pub(crate) close_millis: Arc<dyn CounterFn>,
     }
 
     impl CompactionStats {
@@ -1001,6 +1007,9 @@ pub mod stats {
                 bytes_compacted: recorder.counter(BYTES_COMPACTED).register(),
                 total_bytes_being_compacted: recorder.gauge(TOTAL_BYTES_BEING_COMPACTED).register(),
                 total_throughput: recorder.gauge(TOTAL_THROUGHPUT_BYTES_PER_SEC).register(),
+                read_millis: recorder.counter(READ_MILLIS).register(),
+                write_millis: recorder.counter(WRITE_MILLIS).register(),
+                close_millis: recorder.counter(CLOSE_MILLIS).register(),
             }
         }
     }

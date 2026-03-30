@@ -402,7 +402,19 @@ impl TokioCompactionExecutorInner {
             estimate_bytes_before_key(args.sorted_runs.as_slice(), k)
         });
 
-        while let Some(kv) = all_iter.next().await? {
+        let mut read_nanos: u64 = 0;
+        let mut write_nanos: u64 = 0;
+        let mut close_nanos: u64 = 0;
+
+        loop {
+            let read_start = tokio::time::Instant::now();
+            let maybe_kv = all_iter.next().await?;
+            read_nanos += read_start.elapsed().as_nanos() as u64;
+
+            let Some(kv) = maybe_kv else {
+                break;
+            };
+
             let duration_since_last_report =
                 self.clock.now().signed_duration_since(last_progress_report);
             if duration_since_last_report > TimeDelta::seconds(1) {
@@ -412,15 +424,21 @@ impl TokioCompactionExecutorInner {
             }
 
             let current_key = kv.key.clone();
+            let write_start = tokio::time::Instant::now();
             if let Some(block_size) = current_writer.add(kv).await? {
                 bytes_written += block_size;
             }
+            write_nanos += write_start.elapsed().as_nanos() as u64;
 
             if bytes_written > self.options.max_sst_size {
                 // Prevent a single key from spanning multiple SSTs in an SR.
                 // The current read logic expects this. See #1367.
                 // This is a temporary fix until we implement #1371.
-                let should_rollover = match all_iter.peek().await? {
+                let read_start = tokio::time::Instant::now();
+                let peek_result = all_iter.peek().await?;
+                read_nanos += read_start.elapsed().as_nanos() as u64;
+
+                let should_rollover = match peek_result {
                     Some(next_kv) => next_kv.key != current_key,
                     None => true,
                 };
@@ -432,7 +450,9 @@ impl TokioCompactionExecutorInner {
                             self.rand.rng().gen_ulid(self.clock.as_ref()),
                         )),
                     );
+                    let close_start = tokio::time::Instant::now();
                     let sst = finished_writer.close().await?;
+                    close_nanos += close_start.elapsed().as_nanos() as u64;
 
                     self.stats.bytes_compacted.increment(sst.info.filter_offset);
                     output_ssts.push(sst);
@@ -445,11 +465,17 @@ impl TokioCompactionExecutorInner {
         }
 
         if !current_writer.is_drained() {
+            let close_start = tokio::time::Instant::now();
             let sst = current_writer.close().await?;
+            close_nanos += close_start.elapsed().as_nanos() as u64;
 
             self.stats.bytes_compacted.increment(sst.info.filter_offset);
             output_ssts.push(sst);
         }
+
+        self.stats.read_millis.increment(read_nanos / 1_000_000);
+        self.stats.write_millis.increment(write_nanos / 1_000_000);
+        self.stats.close_millis.increment(close_nanos / 1_000_000);
 
         Ok(SortedRun {
             id: args.destination,
