@@ -68,28 +68,57 @@ impl SourceId {
     }
 }
 
-/// Immutable spec that describes a compaction. Holds the target segment, the
-/// input sources, and the destination SR id for a compaction.
+/// Immutable spec that describes a compaction. Two variants are supported
+/// per RFC-0024:
 ///
-/// Every spec names exactly one segment (see RFC 24): an empty `segment`
-/// targets the compatibility-encoded `prefix=""` segment (i.e. the root tree),
-/// and a non-empty `segment` targets the named segment with that prefix. All
-/// `sources` for a single spec must come from the named segment's tree;
-/// mixing trees is invalid.
+/// - [`CompactionSpec::Tiered`] is the standard merge: read input sources,
+///   write a single output sorted run with a destination id.
+/// - [`CompactionSpec::DrainSegment`] retires a named segment without
+///   merging — the compactor names the L0s and SRs it has observed, and the
+///   commit advances the segment's watermark and clears its `compacted` list.
+///
+/// Every spec names exactly one segment (see RFC 24). For tiered specs an
+/// empty `segment` targets the compatibility-encoded `prefix=""` segment
+/// (root tree); a non-empty `segment` targets the named segment. Drain
+/// specs require a non-empty `segment` — the empty-prefix segment cannot
+/// be drained.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CompactionSpec {
+pub enum CompactionSpec {
+    Tiered(TieredCompactionSpec),
+    DrainSegment(DrainSegmentSpec),
+}
+
+/// Tiered compaction spec: read inputs, merge into one output sorted run.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TieredCompactionSpec {
     /// Target segment prefix. Empty `Bytes` targets the `prefix=""` segment.
     segment: Bytes,
     /// Input sources for the compaction.
     sources: Vec<SourceId>,
-    /// Destination sorted run id for the compaction.
+    /// Destination sorted run id for the compaction output.
     destination: u32,
 }
 
+/// Drain-segment spec: retire a named segment as part of segment retention.
+/// No merge is performed; on commit the segment's watermark advances to
+/// cover the listed L0s and the listed sorted runs are removed from
+/// `compacted`. The result is a "drain marker" that the writer prunes once
+/// observed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DrainSegmentSpec {
+    /// Target segment prefix. Must be non-empty — the `prefix=""` segment
+    /// (root tree) cannot be drained.
+    segment: Bytes,
+    /// L0 SSTs and sorted runs the compactor has observed in the segment
+    /// and is draining.
+    sources: Vec<SourceId>,
+}
+
 impl CompactionSpec {
-    /// Creates a new compaction spec targeting the compatibility-encoded
+    /// Creates a tiered compaction spec targeting the compatibility-encoded
     /// `prefix=""` segment (the root tree). For specs that target a named
-    /// segment, use [`CompactionSpec::for_segment`].
+    /// segment, use [`CompactionSpec::for_segment`]. For drain operations,
+    /// use [`CompactionSpec::drain_segment`].
     ///
     /// ## Arguments
     /// - `sources`: Ordered list of sources (L0 SST ULIDs and/or existing SR ids).
@@ -98,7 +127,7 @@ impl CompactionSpec {
         Self::for_segment(Bytes::new(), sources, destination)
     }
 
-    /// Creates a new compaction spec targeting the named segment with the
+    /// Creates a tiered compaction spec targeting the named segment with the
     /// given prefix. An empty `segment` is equivalent to [`CompactionSpec::new`]
     /// and targets the compatibility-encoded `prefix=""` segment.
     ///
@@ -107,39 +136,61 @@ impl CompactionSpec {
     /// - `sources`: Ordered list of sources (L0 SST ULIDs and/or existing SR ids).
     /// - `destination`: Sorted Run id for the compaction output.
     pub fn for_segment(segment: Bytes, sources: Vec<SourceId>, destination: u32) -> Self {
-        Self {
+        CompactionSpec::Tiered(TieredCompactionSpec {
             segment,
             sources,
             destination,
-        }
+        })
+    }
+
+    /// Creates a drain-segment spec targeting the named (non-empty-prefix)
+    /// segment. `sources` lists the L0s and SRs the compactor has observed in
+    /// the segment and is draining.
+    pub fn drain_segment(segment: Bytes, sources: Vec<SourceId>) -> Self {
+        CompactionSpec::DrainSegment(DrainSegmentSpec { segment, sources })
     }
 
     /// The target segment prefix. Empty bytes mean the compatibility-encoded
-    /// `prefix=""` segment (the root tree).
+    /// `prefix=""` segment (only valid for tiered specs).
     pub fn segment(&self) -> &Bytes {
-        &self.segment
+        match self {
+            CompactionSpec::Tiered(s) => &s.segment,
+            CompactionSpec::DrainSegment(s) => &s.segment,
+        }
     }
 
     /// The sources (input SSTs and sorted runs) for this compaction.
-    pub fn sources(&self) -> &Vec<SourceId> {
-        &self.sources
+    pub fn sources(&self) -> &[SourceId] {
+        match self {
+            CompactionSpec::Tiered(s) => &s.sources,
+            CompactionSpec::DrainSegment(s) => &s.sources,
+        }
     }
 
-    /// The destination sorted run id that will be produced by this compaction.
-    pub fn destination(&self) -> u32 {
-        self.destination
+    /// The destination sorted run id this compaction will produce, or `None`
+    /// for drain specs (which produce no new SR).
+    pub fn destination(&self) -> Option<u32> {
+        match self {
+            CompactionSpec::Tiered(s) => Some(s.destination),
+            CompactionSpec::DrainSegment(_) => None,
+        }
+    }
+
+    /// Returns true if this is a [`CompactionSpec::DrainSegment`] spec.
+    pub fn is_drain(&self) -> bool {
+        matches!(self, CompactionSpec::DrainSegment(_))
     }
 
     /// Returns true if any of the compaction sources are L0 SST views.
     pub fn has_l0_sources(&self) -> bool {
-        self.sources
+        self.sources()
             .iter()
             .any(|s| matches!(s, SourceId::SstView(_)))
     }
 
     /// Returns true if any of the compaction sources are sorted runs.
     pub fn has_sr_sources(&self) -> bool {
-        self.sources
+        self.sources()
             .iter()
             .any(|s| matches!(s, SourceId::SortedRun(_)))
     }
@@ -149,16 +200,27 @@ impl Display for CompactionSpec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let displayed_sources: Vec<String> =
             self.sources().iter().map(|s| format!("{}", s)).collect();
-        if self.segment.is_empty() {
-            write!(f, "{:?} -> SR({})", displayed_sources, self.destination())
-        } else {
-            write!(
+        let segment = self.segment();
+        match self {
+            CompactionSpec::Tiered(spec) => {
+                if segment.is_empty() {
+                    write!(f, "{:?} -> SR({})", displayed_sources, spec.destination)
+                } else {
+                    write!(
+                        f,
+                        "[seg={}] {:?} -> SR({})",
+                        String::from_utf8_lossy(segment),
+                        displayed_sources,
+                        spec.destination,
+                    )
+                }
+            }
+            CompactionSpec::DrainSegment(_) => write!(
                 f,
-                "[seg={}] {:?} -> SR({})",
-                String::from_utf8_lossy(&self.segment),
+                "[seg={}] drain {:?}",
+                String::from_utf8_lossy(segment),
                 displayed_sources,
-                self.destination()
-            )
+            ),
         }
     }
 }
@@ -334,21 +396,9 @@ impl Compaction {
 
 impl Display for Compaction {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let displayed_sources: Vec<_> = self
-            .spec
-            .sources()
-            .iter()
-            .map(|s| format!("{}", s))
-            .collect();
-        write!(
-            f,
-            "{:?} -> SR({})",
-            displayed_sources,
-            self.spec.destination(),
-        )?;
+        write!(f, "{}", self.spec)?;
         if self.bytes_processed > 0 {
             let human_bytes_processed = crate::utils::format_bytes_si(self.bytes_processed);
-
             write!(f, " ({} processed)", human_bytes_processed)?;
         }
         Ok(())
@@ -655,16 +705,19 @@ impl CompactorState {
         let spec = compaction.spec();
         // SR ids are globally unique across all segment trees (RFC-0024), so
         // collisions are checked across every active compaction regardless of
-        // target segment.
-        if self
-            .compactions
-            .value
-            .iter_active()
-            .map(|c| c.spec())
-            .any(|c| c.destination() == spec.destination())
-        {
-            // we already have an ongoing compaction for this destination
-            return Err(SlateDBError::InvalidCompaction);
+        // target segment. Drain specs produce no output SR, so the check only
+        // applies to tiered specs.
+        if let Some(dst) = spec.destination() {
+            if self
+                .compactions
+                .value
+                .iter_active()
+                .filter_map(|c| c.spec().destination())
+                .any(|d| d == dst)
+            {
+                // we already have an ongoing compaction for this destination
+                return Err(SlateDBError::InvalidCompaction);
+            }
         }
         let Some(tree) = self.db_state().tree_for_segment(spec.segment()) else {
             // spec targets a named segment that does not exist
@@ -681,19 +734,22 @@ impl CompactorState {
         }
         // SR ids are globally unique across all segment trees (RFC-0024), so
         // an existing SR with the same id anywhere in the manifest blocks the
-        // spec unless that SR is among its sources.
-        if self
-            .db_state()
-            .trees()
-            .flat_map(|t| t.compacted.iter())
-            .any(|sr| sr.id == spec.destination())
-            && !spec.sources().iter().any(|src| match src {
-                SourceId::SortedRun(sr) => *sr == spec.destination(),
-                SourceId::SstView(_) => false,
-            })
-        {
-            // the compaction overwrites an existing sr but doesn't include the sr
-            return Err(SlateDBError::InvalidCompaction);
+        // spec unless that SR is among its sources. Drain specs produce no
+        // output SR, so the overwrite check applies only to tiered specs.
+        if let Some(dst) = spec.destination() {
+            if self
+                .db_state()
+                .trees()
+                .flat_map(|t| t.compacted.iter())
+                .any(|sr| sr.id == dst)
+                && !spec.sources().iter().any(|src| match src {
+                    SourceId::SortedRun(sr) => *sr == dst,
+                    SourceId::SstView(_) => false,
+                })
+            {
+                // the compaction overwrites an existing sr but doesn't include the sr
+                return Err(SlateDBError::InvalidCompaction);
+            }
         }
         info!("accepted submitted compaction [compaction={}]", compaction);
 
@@ -733,6 +789,10 @@ impl CompactorState {
         if let Some(compaction) = self.compactions.value.get_mut(&compaction_id) {
             let spec = compaction.spec();
             info!("finished compaction [spec={}]", spec);
+            // Tiered finish path; drain dispatch lands in a follow-up commit.
+            let dst = spec
+                .destination()
+                .expect("finish_compaction with output SR called on a non-tiered spec");
             let segment = spec.segment().clone();
             // reconstruct l0
             let compaction_l0s: HashSet<Ulid> = spec
@@ -743,7 +803,7 @@ impl CompactorState {
             let compaction_srs: HashSet<u32> = spec
                 .sources()
                 .iter()
-                .chain(std::iter::once(&SourceId::SortedRun(spec.destination())))
+                .chain(std::iter::once(&SourceId::SortedRun(dst)))
                 .filter_map(|id| id.maybe_unwrap_sorted_run())
                 .collect();
             let first_source = *spec

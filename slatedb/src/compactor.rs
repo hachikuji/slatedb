@@ -740,10 +740,13 @@ impl CompactorEventHandler {
                 .compacted
                 .first()
                 .map_or(0, |sr| sr.id + 1);
-            if compaction.destination() < highest_id {
-                warn!("compaction destination is lesser than the expected L0-only highest_id: {:?} {:?}",
-                compaction.destination(), highest_id);
-                return Err(SlateDBError::InvalidCompaction);
+            // Drain specs have no destination and aren't subject to this check.
+            if let Some(dst) = compaction.destination() {
+                if dst < highest_id {
+                    warn!("compaction destination is lesser than the expected L0-only highest_id: {:?} {:?}",
+                    dst, highest_id);
+                    return Err(SlateDBError::InvalidCompaction);
+                }
             }
         }
 
@@ -902,16 +905,19 @@ impl CompactorEventHandler {
         let sst_views = compaction.get_l0_sst_views(db_state);
         let sorted_runs = compaction.get_sorted_runs(db_state);
         let spec = compaction.spec();
+        // Drain specs are not yet routed through start_compaction; the merge
+        // executor only accepts tiered specs in this commit. Drain dispatch
+        // lands in the follow-up commit.
+        let destination = spec
+            .destination()
+            .expect("start_compaction is tiered-only — drain dispatch lands in a follow-up");
         // The destination SR's "last run" status is scoped to its own tree
         // (RFC-0024). If the target tree is missing — e.g. concurrently
         // drained — fall back to false; the compaction commit will no-op.
         let is_dest_last_run = match db_state.tree_for_segment(spec.segment()) {
             Some(tree) => {
                 tree.compacted.is_empty()
-                    || tree
-                        .compacted
-                        .last()
-                        .is_some_and(|sr| spec.destination() == sr.id)
+                    || tree.compacted.last().is_some_and(|sr| destination == sr.id)
             }
             None => false,
         };
@@ -919,7 +925,7 @@ impl CompactorEventHandler {
         let job_args = StartCompactionJobArgs {
             id: job_id,
             compaction_id: compaction.id(),
-            destination: spec.destination(),
+            destination,
             sst_views,
             sorted_runs,
             output_ssts: compaction.output_ssts().clone(),
@@ -3013,7 +3019,7 @@ mod tests {
         let expected_sources = vec![SourceId::SortedRun(2), SourceId::SortedRun(1)];
 
         assert_eq!(stored.spec().sources(), &expected_sources);
-        assert_eq!(stored.spec().destination(), 1);
+        assert_eq!(stored.spec().destination(), Some(1));
         assert_eq!(stored.status(), CompactionStatus::Submitted);
     }
 
@@ -3086,7 +3092,7 @@ mod tests {
         let expected_sources = vec![SourceId::SortedRun(5), SourceId::SortedRun(2)];
         assert_eq!(planned.len(), 1);
         assert_eq!(planned[0].sources(), &expected_sources);
-        assert_eq!(planned[0].destination(), 2);
+        assert_eq!(planned[0].destination(), Some(2));
     }
 
     #[test]
@@ -3593,7 +3599,10 @@ mod tests {
         fixture.write_l0().await;
         fixture.handler.state_writer.refresh().await.unwrap();
         let spec = fixture.build_l0_compaction().await;
-        let spec_alt = CompactionSpec::new(spec.sources().clone(), spec.destination() + 1);
+        let spec_alt = CompactionSpec::new(
+            spec.sources().to_vec(),
+            spec.destination().expect("tiered spec") + 1,
+        );
         let first_id = Ulid::from_parts(1, 0);
         let second_id = Ulid::from_parts(2, 0);
         fixture
@@ -3871,7 +3880,7 @@ mod tests {
         // Build a minimal successful result
         let db_state = fixture.latest_db_state().await;
         let output_sr = SortedRun {
-            id: compaction.destination(),
+            id: compaction.destination().expect("tiered spec"),
             sst_views: db_state.tree.l0.iter().cloned().collect(),
         };
         let msg = CompactorMessage::CompactionJobFinished {
