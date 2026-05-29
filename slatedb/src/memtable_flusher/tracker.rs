@@ -44,6 +44,11 @@ pub(crate) const FLUSH_REQUEST_COUNT: &str = memtable_flush_stat_name!("flush_re
 pub(crate) const L0_UPLOAD_COUNT: &str = memtable_flush_stat_name!("l0_upload_count");
 pub(crate) const L0_FLUSH_COUNT: &str = memtable_flush_stat_name!("l0_flush_count");
 pub(crate) const MANIFEST_REFRESH_COUNT: &str = memtable_flush_stat_name!("manifest_refresh_count");
+/// Incremented each time L0 flush dispatch is blocked because a touched
+/// segment has reached `l0_max_ssts` (or `l0_max_ssts_per_key`) and the
+/// next memtable cannot be uploaded yet.
+pub(crate) const L0_DISPATCH_GATED_COUNT: &str =
+    memtable_flush_stat_name!("l0_dispatch_gated_count");
 
 pub(crate) struct FlushTrackerStats {
     pub(crate) memtable_freeze_count: Arc<dyn CounterFn>,
@@ -52,6 +57,7 @@ pub(crate) struct FlushTrackerStats {
     pub(crate) l0_upload_count: Arc<dyn CounterFn>,
     pub(crate) l0_flush_count: Arc<dyn CounterFn>,
     pub(crate) manifest_refresh_count: Arc<dyn CounterFn>,
+    pub(crate) l0_dispatch_gated_count: Arc<dyn CounterFn>,
 }
 
 impl FlushTrackerStats {
@@ -63,6 +69,7 @@ impl FlushTrackerStats {
             l0_upload_count: recorder.counter(L0_UPLOAD_COUNT).register(),
             l0_flush_count: recorder.counter(L0_FLUSH_COUNT).register(),
             manifest_refresh_count: recorder.counter(MANIFEST_REFRESH_COUNT).register(),
+            l0_dispatch_gated_count: recorder.counter(L0_DISPATCH_GATED_COUNT).register(),
         }
     }
 }
@@ -326,6 +333,7 @@ impl FlushTracker {
                 return Ok(());
             };
             if !self.can_dispatch(&self.frontier.tracked[idx].imm_memtable) {
+                self.stats.l0_dispatch_gated_count.increment(1);
                 return Ok(());
             }
             self.frontier.tracked[idx].state = TrackedImmState::Uploading;
