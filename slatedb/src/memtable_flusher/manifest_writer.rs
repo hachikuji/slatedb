@@ -19,7 +19,7 @@ use super::uploader::UploadedMemtable;
 use crate::checkpoint::CheckpointCreateResult;
 use crate::config::CheckpointOptions;
 use crate::db::DbInner;
-use crate::db_state::SsTableView;
+use crate::db_state::{max_l0_overlap, SsTableView};
 use crate::dispatcher::MessageHandler;
 use crate::error::SlateDBError;
 use crate::manifest::store::FenceableManifest;
@@ -31,7 +31,7 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use std::cmp;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Handle;
@@ -193,6 +193,63 @@ impl ManifestWriter {
             log::warn!("failed to shutdown l0 manifest writer [error={:?}]", e);
         }
     }
+}
+
+/// Returns `true` if committing `uploaded` keeps every L0 tree it lands in
+/// within both `l0_max_ssts` and `l0_max_ssts_per_key`, accounting for the
+/// committed L0 (`core`) plus the views admitted earlier in this batch
+/// (`projection`, keyed by segment prefix). On `true`, `projection` is
+/// extended with this imm's views; on `false` it is left unchanged apart from
+/// idempotent seeding, so the caller can stop the batch cleanly.
+///
+/// An imm whose retention pruned every entry has no segments, adds nothing to
+/// L0, and always fits.
+fn batch_within_l0_caps(
+    uploaded: &UploadedMemtable,
+    core: &crate::manifest::ManifestCore,
+    settings: &crate::config::Settings,
+    projection: &mut HashMap<Bytes, VecDeque<SsTableView>>,
+) -> bool {
+    // Group this imm's uploaded SSTs by the tree they land in, mirroring
+    // `apply_uploaded_state`'s routing (empty prefix -> root tree, named
+    // prefix -> segment tree). `identity` derives a deterministic view id
+    // without consuming `DbRand`; only the key range matters here.
+    let mut additions: HashMap<Bytes, Vec<SsTableView>> = HashMap::new();
+    for segment in &uploaded.segments {
+        additions
+            .entry(segment.prefix.clone())
+            .or_default()
+            .push(SsTableView::identity(segment.sst_handle.clone()));
+    }
+
+    let seed = |prefix: &Bytes| {
+        core.tree_for_segment(prefix)
+            .map(|tree| tree.l0.clone())
+            .unwrap_or_default()
+    };
+
+    // First verify every touched tree stays within both caps; only mutate
+    // `projection` once all of this imm's trees pass.
+    for (prefix, new_views) in &additions {
+        let projected = projection
+            .entry(prefix.clone())
+            .or_insert_with(|| seed(prefix));
+        if projected.len() + new_views.len() > settings.l0_max_ssts {
+            return false;
+        }
+        let mut trial = projected.clone();
+        trial.extend(new_views.iter().cloned());
+        if max_l0_overlap(&trial) > settings.l0_max_ssts_per_key {
+            return false;
+        }
+    }
+    for (prefix, new_views) in additions {
+        projection
+            .entry(prefix.clone())
+            .or_insert_with(|| seed(&prefix))
+            .extend(new_views);
+    }
+    true
 }
 
 struct ManifestWriterHandler {
@@ -385,10 +442,21 @@ impl ManifestWriterHandler {
 
     fn take_next_ready_batch(&mut self) -> Option<Vec<UploadedMemtable>> {
         let durable_seq = self.db_status_rx.borrow().durable_seq;
-        let imm_memtables: Vec<_> = {
-            let guard = self.db.state.read();
-            guard.state().imm_memtable.iter().rev().cloned().collect()
-        };
+        // `state()` is a cheap `Arc<COWDbState>` snapshot, so we can read the
+        // committed L0 and the imm order without holding the state lock across
+        // the loop.
+        let snapshot = self.db.state.read().state();
+        let core = snapshot.core();
+        let imm_memtables: Vec<_> = snapshot.imm_memtable.iter().rev().cloned().collect();
+
+        // L0 backpressure is enforced here, at the manifest write, not at
+        // upload dispatch: uploads may run ahead of a full or slow-draining L0
+        // (memory is bounded separately by `max_unflushed_bytes`), but a batch
+        // is only committed while every L0 tree it lands in stays within
+        // `l0_max_ssts` and `l0_max_ssts_per_key`. `projection` tracks the
+        // committed L0 plus the views admitted so far in this batch, keyed by
+        // segment prefix.
+        let mut projection: HashMap<Bytes, VecDeque<SsTableView>> = HashMap::new();
         let mut batch = Vec::new();
 
         for imm_memtable in imm_memtables {
@@ -406,6 +474,14 @@ impl ManifestWriterHandler {
             );
             // WAL SSTs must be durable before the manifest is updated (see #1255).
             if self.db.wal_enabled && uploaded.last_seq > durable_seq {
+                break;
+            }
+            // Stop the batch here (leaving this imm in `ready`) if committing it
+            // would push an L0 tree past a cap. The FIFO commit order means a
+            // later imm cannot jump ahead, so we wait; a subsequent manifest
+            // poll re-runs this once compaction has drained L0.
+            if !batch_within_l0_caps(uploaded, core, &self.db.settings, &mut projection) {
+                self.db.db_stats.l0_commit_gated_count.increment(1);
                 break;
             }
 
@@ -991,9 +1067,23 @@ mod tests {
         fp_registry: Arc<FailPointRegistry>,
         segment_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
     ) -> TestHarness {
+        setup_harness_with_extractor_and_settings(
+            path,
+            fp_registry,
+            segment_extractor,
+            Settings::default(),
+        )
+        .await
+    }
+
+    async fn setup_harness_with_extractor_and_settings(
+        path: &str,
+        fp_registry: Arc<FailPointRegistry>,
+        segment_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
+        settings: Settings,
+    ) -> TestHarness {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = path.to_string();
-        let settings = Settings::default();
         let system_clock: Arc<dyn SystemClock> = Arc::new(DefaultSystemClock::new());
         let rand = Arc::new(DbRand::new(42));
         let db_metrics = MetricsRecorderHelper::noop();
@@ -1889,6 +1979,81 @@ mod tests {
         assert_eq!(core.segments[1].prefix.as_ref(), b"bbb");
         assert_eq!(core.segments[0].tree.l0.len(), 2);
         assert_eq!(core.segments[1].tree.l0.len(), 1);
+
+        started.shutdown().await;
+    }
+
+    /// L0 backpressure is enforced at the manifest write, per-tree: a flush
+    /// landing in a saturated segment is held (its commit waits) while a flush
+    /// landing in an untouched segment commits normally, and the held commit
+    /// proceeds once the saturated segment drains. Uses `l0_max_ssts = 1` so a
+    /// single L0 saturates a segment.
+    #[tokio::test]
+    async fn commit_gate_holds_only_the_saturated_segment() {
+        let settings = Settings {
+            l0_max_ssts: 1,
+            ..Settings::default()
+        };
+        let harness = setup_harness_with_extractor_and_settings(
+            "/tmp/test_manifest_writer_segment_commit_gate",
+            Arc::new(FailPointRegistry::new()),
+            Some(Arc::new(StubExtractor)),
+            settings,
+        )
+        .await;
+        let inner = Arc::clone(&harness.inner);
+        let started = start_manifest_writer(
+            Arc::clone(&inner),
+            harness.manifest,
+            Duration::from_secs(3600),
+        );
+
+        // Fill segment "aaa" to l0_max_ssts.
+        let uploaded1 =
+            next_uploaded_memtable_with_segments(&inner, b"aaa-1", b"v1", &[b"aaa"]).await;
+        started.notify_uploaded(uploaded1).await.unwrap();
+        assert_eq!(expect_flushed(&started.tracker_rx).await, 1);
+
+        // A flush landing in the untouched segment "bbb" commits even though
+        // "aaa" is saturated — the caps are enforced per-tree.
+        let uploaded2 =
+            next_uploaded_memtable_with_segments(&inner, b"bbb-1", b"v2", &[b"bbb"]).await;
+        started.notify_uploaded(uploaded2).await.unwrap();
+        assert_eq!(expect_flushed(&started.tracker_rx).await, 2);
+
+        // A flush landing back in the saturated "aaa" is held at the commit —
+        // the upload completed (it's in `ready`) but the manifest write waits.
+        let uploaded3 =
+            next_uploaded_memtable_with_segments(&inner, b"aaa-2", b"v3", &[b"aaa"]).await;
+        let last_seq3 = uploaded3.last_seq;
+        started.notify_uploaded(uploaded3).await.unwrap();
+        assert_no_flush_event(&started.tracker_rx, Duration::from_millis(100)).await;
+
+        // Drain "aaa" (as a compaction would) in the local committed state.
+        {
+            let mut guard = inner.state.write();
+            guard.modify(|modifier| {
+                modifier
+                    .state
+                    .manifest
+                    .value
+                    .core
+                    .tree_for_segment_mut(b"aaa")
+                    .expect("segment aaa exists")
+                    .l0
+                    .clear();
+            });
+        }
+        // A flush request also drives `process_ready_work`, so it both re-runs
+        // the held commit and confirms the imm became durable.
+        let (tx, rx) = oneshot::channel();
+        started.send_flush(Some(last_seq3), tx).unwrap();
+        let result = timeout(Duration::from_secs(5), rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.durable_seq, last_seq3);
 
         started.shutdown().await;
     }

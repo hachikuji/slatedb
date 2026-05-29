@@ -26,6 +26,11 @@ pub const TOTAL_MEM_SIZE_BYTES: &str = db_stat_name!("total_mem_size_bytes");
 pub const L0_SST_COUNT: &str = db_stat_name!("l0_sst_count");
 pub const SEGMENT_MAX_L0_SST_COUNT: &str = db_stat_name!("segment_max_l0_sst_count");
 pub const L0_FLUSH_BYTES: &str = db_stat_name!("l0_flush_bytes");
+/// Incremented each time an L0 flush batch commit is gated because committing
+/// the next uploaded memtable would push an L0 tree past `l0_max_ssts` (or
+/// `l0_max_ssts_per_key`). Uploads run ahead of L0; this counts how often the
+/// manifest commit had to wait for L0 capacity to free up.
+pub const L0_COMMIT_GATED_COUNT: &str = db_stat_name!("l0_commit_gated_count");
 pub const SST_FILTER_FALSE_POSITIVE_COUNT: &str = db_stat_name!("sst_filter_false_positive_count");
 pub const SST_FILTER_POSITIVE_COUNT: &str = db_stat_name!("sst_filter_positive_count");
 pub const SST_FILTER_NEGATIVE_COUNT: &str = db_stat_name!("sst_filter_negative_count");
@@ -65,6 +70,7 @@ pub(crate) struct DbStatsInner {
     pub(crate) l0_sst_count: Arc<dyn GaugeFn>,
     pub(crate) segment_max_l0_sst_count: Arc<dyn GaugeFn>,
     pub(crate) l0_flush_bytes: Arc<dyn CounterFn>,
+    pub(crate) l0_commit_gated_count: Arc<dyn CounterFn>,
     pub(crate) merge_operator_read_operands: Arc<dyn CounterFn>,
     pub(crate) merge_operator_flush_operands: Arc<dyn CounterFn>,
     pub(crate) memtable_write_bytes: Arc<dyn CounterFn>,
@@ -135,6 +141,7 @@ impl DbStats {
             l0_sst_count: recorder.gauge(L0_SST_COUNT).register(),
             segment_max_l0_sst_count: recorder.gauge(SEGMENT_MAX_L0_SST_COUNT).register(),
             l0_flush_bytes: recorder.counter(L0_FLUSH_BYTES).register(),
+            l0_commit_gated_count: recorder.counter(L0_COMMIT_GATED_COUNT).register(),
             merge_operator_read_operands: recorder
                 .counter(MERGE_OPERATOR_OPERANDS)
                 .labels(&[(MERGE_OPERATOR_PATH_LABEL, MERGE_OPERATOR_READ_PATH)])

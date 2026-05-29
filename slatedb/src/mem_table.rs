@@ -297,12 +297,6 @@ impl ImmutableMemtable {
         }
     }
 
-    /// Segment prefixes touched by writes in this imm.
-    /// Delegate to [`KVTable::touched_segments`].
-    pub(crate) fn touched_segments(&self) -> std::collections::BTreeSet<Bytes> {
-        self.table.touched_segments()
-    }
-
     pub(crate) fn table(&self) -> Arc<KVTable> {
         self.table.clone()
     }
@@ -379,17 +373,6 @@ impl KVTable {
     /// distinct active segments — typically one).
     pub(crate) fn touched_segments(&self) -> std::collections::BTreeSet<Bytes> {
         self.touched_segments.lock().clone()
-    }
-
-    /// True iff this table's touched-segment set is empty *or* contains
-    /// `prefix`. Used by per-prefix reservation accounting on the
-    /// dispatch tracker, where an empty set is treated conservatively
-    /// as "may target any prefix" (because we can't rule it out).
-    /// Avoids cloning the full set when a single membership check
-    /// suffices.
-    pub(crate) fn touched_segments_empty_or_contains(&self, prefix: &Bytes) -> bool {
-        let touched = self.touched_segments.lock();
-        touched.is_empty() || touched.contains(prefix)
     }
 
     /// Validate `prefix` against this table's touched-segment set
