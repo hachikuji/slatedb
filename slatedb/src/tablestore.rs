@@ -29,6 +29,8 @@ use crate::sst_stats::SstStats;
 use crate::types::RowEntry;
 use crate::wal::wal_sst_builder::EncodedWalSsTableBuilder;
 
+const SST_UPLOAD_CHUNK_SIZE: usize = 32 * 1024;
+
 pub(crate) struct TableStore {
     object_stores: ObjectStores,
     sst_format: SsTableFormat,
@@ -281,6 +283,7 @@ impl TableStore {
             id,
             builder: self.sst_format.table_builder(),
             writer: BufWriter::new(object_store, path),
+            pending_upload_bytes: Vec::with_capacity(SST_UPLOAD_CHUNK_SIZE),
             table_store: self,
             #[cfg(test)]
             blocks_written: 0,
@@ -1009,11 +1012,36 @@ async fn write_sst_streaming_in_object_store(
     encoded_sst: &EncodedSsTable,
 ) -> Result<(), SlateDBError> {
     let mut writer = BufWriter::new(object_store, path.clone());
+    let mut pending = Vec::with_capacity(SST_UPLOAD_CHUNK_SIZE);
     for block in &encoded_sst.unconsumed_blocks {
-        writer.put(block.encoded_bytes.clone()).await?;
+        put_sst_upload_bytes(&mut writer, block.encoded_bytes.clone(), &mut pending).await?;
     }
-    writer.put(encoded_sst.footer.clone()).await?;
+    put_sst_upload_bytes(&mut writer, encoded_sst.footer.clone(), &mut pending).await?;
+    if !pending.is_empty() {
+        writer.put(Bytes::from(pending)).await?;
+    }
     writer.shutdown().await?;
+    Ok(())
+}
+
+async fn put_sst_upload_bytes(
+    writer: &mut BufWriter,
+    mut bytes: Bytes,
+    pending: &mut Vec<u8>,
+) -> Result<(), SlateDBError> {
+    while !bytes.is_empty() {
+        if pending.is_empty() && bytes.len() >= SST_UPLOAD_CHUNK_SIZE {
+            writer.put(bytes.split_to(SST_UPLOAD_CHUNK_SIZE)).await?;
+            continue;
+        }
+
+        let to_copy = (SST_UPLOAD_CHUNK_SIZE - pending.len()).min(bytes.len());
+        pending.extend_from_slice(&bytes.split_to(to_copy));
+        if pending.len() == SST_UPLOAD_CHUNK_SIZE {
+            let chunk = std::mem::replace(pending, Vec::with_capacity(SST_UPLOAD_CHUNK_SIZE));
+            writer.put(Bytes::from(chunk)).await?;
+        }
+    }
     Ok(())
 }
 
@@ -1021,6 +1049,7 @@ pub(crate) struct EncodedSsTableWriter<'a> {
     id: SsTableId,
     builder: EncodedSsTableBuilder<'a>,
     writer: BufWriter,
+    pending_upload_bytes: Vec<u8>,
     table_store: &'a TableStore,
     #[cfg(test)]
     blocks_written: usize,
@@ -1039,10 +1068,24 @@ impl EncodedSsTableWriter<'_> {
     pub(crate) async fn close(mut self) -> Result<SsTableHandle, SlateDBError> {
         let mut encoded_sst = self.builder.build().await?;
         while let Some(block) = encoded_sst.unconsumed_blocks.pop_front() {
-            self.writer.write_all(block.encoded_bytes.as_ref()).await?;
+            put_sst_upload_bytes(
+                &mut self.writer,
+                block.encoded_bytes,
+                &mut self.pending_upload_bytes,
+            )
+            .await?;
         }
 
-        self.writer.write_all(encoded_sst.footer.as_ref()).await?;
+        put_sst_upload_bytes(
+            &mut self.writer,
+            encoded_sst.footer,
+            &mut self.pending_upload_bytes,
+        )
+        .await?;
+        if !self.pending_upload_bytes.is_empty() {
+            let pending = std::mem::take(&mut self.pending_upload_bytes);
+            self.writer.put(Bytes::from(pending)).await?;
+        }
         self.writer.shutdown().await?;
         self.table_store
             .cache_filters(self.id, encoded_sst.info.filter_offset, encoded_sst.filters)
@@ -1056,7 +1099,12 @@ impl EncodedSsTableWriter<'_> {
 
     async fn drain_blocks(&mut self) -> Result<(), SlateDBError> {
         while let Some(block) = self.builder.next_block() {
-            self.writer.write_all(block.encoded_bytes.as_ref()).await?;
+            put_sst_upload_bytes(
+                &mut self.writer,
+                block.encoded_bytes,
+                &mut self.pending_upload_bytes,
+            )
+            .await?;
             #[cfg(test)]
             {
                 self.blocks_written += 1;
