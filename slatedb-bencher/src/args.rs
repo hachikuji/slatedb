@@ -51,6 +51,7 @@ pub(crate) struct BencherArgs {
 #[derive(Subcommand, Clone)]
 pub(crate) enum BencherCommands {
     Db(BenchmarkDbArgs),
+    Tsdb(BenchmarkTsdbArgs),
     Compaction(BenchmarkCompactionArgs),
     Transaction(BenchmarkTransactionArgs),
 }
@@ -184,6 +185,81 @@ pub(crate) struct BenchmarkDbArgs {
         default_value_t = false
     )]
     pub(crate) no_compactor: bool,
+}
+
+#[derive(Args, Clone)]
+#[command(about = "Benchmark segment-oriented compaction (RFC-0024) with a TSDB-shaped workload.")]
+pub(crate) struct BenchmarkTsdbArgs {
+    #[clap(flatten)]
+    pub(crate) db_args: DbArgs,
+
+    #[arg(long, help = "The duration in seconds to run the benchmark for.")]
+    pub(crate) duration: Option<u32>,
+
+    #[arg(
+        long,
+        help = "Build the database with a segment extractor (the segmented arm). \
+                Omit for the unsegmented arm.",
+        default_value_t = false
+    )]
+    pub(crate) segmented: bool,
+
+    #[arg(
+        long,
+        help = "Number of distinct metrics written into each time bucket.",
+        default_value_t = 1000
+    )]
+    pub(crate) num_metrics: u32,
+
+    #[arg(
+        long,
+        help = "Approximate size in bytes of one time bucket (controls how often \
+                the writer advances to the next bucket/segment).",
+        default_value_t = 256 * 1024 * 1024
+    )]
+    pub(crate) bucket_bytes: u64,
+
+    #[arg(
+        long,
+        help = "The length of the values to generate.",
+        default_value_t = 1024
+    )]
+    pub(crate) val_len: usize,
+
+    #[arg(
+        long,
+        help = "Width of the sliding read window, in (sealed) buckets.",
+        default_value_t = 20
+    )]
+    pub(crate) window_buckets: u64,
+
+    #[arg(
+        long,
+        help = "Zipf exponent for metric selection on reads (higher = more skew, \
+                smaller hot read set).",
+        default_value_t = 1.1
+    )]
+    pub(crate) zipf_s: f64,
+
+    #[arg(
+        long,
+        help = "The number of reader tasks to spawn.",
+        default_value_t = 4
+    )]
+    pub(crate) readers: u32,
+
+    #[arg(
+        long,
+        help = "Whether to await durable writes.",
+        default_value_t = false
+    )]
+    pub(crate) await_durable: bool,
+
+    #[arg(
+        long,
+        help = "Path to write the per-window metrics CSV. If unset, metrics are only logged."
+    )]
+    pub(crate) metrics_csv: Option<String>,
 }
 
 /// Trait for types that can supply key generators

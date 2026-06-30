@@ -3,7 +3,7 @@
 use crate::args::BencherArgs;
 use args::{
     BencherCommands, BenchmarkCompactionArgs, BenchmarkDbArgs, BenchmarkTransactionArgs,
-    CompactionSubcommands, KeyGeneratorSupplier,
+    BenchmarkTsdbArgs, CompactionSubcommands, KeyGeneratorSupplier,
 };
 use bytes::Bytes;
 use clap::Parser;
@@ -33,6 +33,7 @@ pub mod db;
 pub mod stats;
 pub mod system_monitor;
 pub mod transactions;
+pub mod tsdb;
 
 const CLEANUP_NAME: &str = ".clean_benchmark_data";
 
@@ -60,6 +61,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     match args.command {
         BencherCommands::Db(subcommand_args) => {
             exec_benchmark_db(path.clone(), object_store.clone(), subcommand_args).await;
+        }
+        BencherCommands::Tsdb(subcommand_args) => {
+            exec_benchmark_tsdb(path.clone(), object_store.clone(), subcommand_args).await;
         }
         BencherCommands::Compaction(subcommand_args) => {
             exec_benchmark_compaction(path.clone(), object_store.clone(), subcommand_args).await;
@@ -107,6 +111,52 @@ async fn exec_benchmark_db(path: Path, object_store: Arc<dyn ObjectStore>, args:
         db.clone(),
     );
     bencher.run().await;
+
+    db.close().await.expect("failed to close db");
+}
+
+async fn exec_benchmark_tsdb(
+    path: Path,
+    object_store: Arc<dyn ObjectStore>,
+    args: BenchmarkTsdbArgs,
+) {
+    let (config, memory_cache) = args.db_args.config().unwrap();
+    let write_options = WriteOptions {
+        await_durable: args.await_durable,
+        ..Default::default()
+    };
+
+    let recorder = Arc::new(slatedb_common::metrics::DefaultMetricsRecorder::new());
+
+    let mut builder = Db::builder(path.clone(), object_store.clone())
+        .with_settings(config)
+        .with_metrics_recorder(recorder.clone());
+
+    // The only difference between the two arms: the segment extractor.
+    if args.segmented {
+        builder = builder.with_segment_extractor(Arc::new(tsdb::BucketPrefixExtractor));
+    }
+
+    if let Some(memory_cache) = memory_cache {
+        builder = builder.with_db_cache(memory_cache);
+    }
+
+    let db = Arc::new(builder.build().await.unwrap());
+
+    tsdb::run(
+        db.clone(),
+        recorder,
+        write_options,
+        args.num_metrics,
+        args.bucket_bytes,
+        args.val_len,
+        args.window_buckets,
+        args.zipf_s,
+        args.readers,
+        args.duration.map(|d| Duration::from_secs(d as u64)),
+        args.metrics_csv,
+    )
+    .await;
 
     db.close().await.expect("failed to close db");
 }
